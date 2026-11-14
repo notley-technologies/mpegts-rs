@@ -1,0 +1,36 @@
+[package]
+name = "mpegts"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "MPEG transport stream analyser and demultiplexer with a C API"
+repository = "https://github.com/notley-technologies/mpegts-rs"
+readme = "README.md"
+keywords = ["mpeg-ts", "transport-stream", "demuxer", "klv", "video"]
+categories = ["multimedia::video", "parser-implementations"]
+license = "Apache-2.0"
+exclude = ["*.ts", "target", "fuzz"]
+
+[lib]
+# rlib for Rust users; cdylib and staticlib for the C ABI (include/mpegts.h).
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+## Derive `serde::Serialize` for the report types.
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[[example]]
+name = "json"
+required-features = ["serde"]
+
+# Applies when this crate is built on its own (C library, examples), not
+# when it is a dependency.
+[profile.release]
+lto = true
+codegen-units = 1

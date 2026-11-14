@@ -1,0 +1,25 @@
+# Semantic versioning: same major version, and while the major version is
+# 0, same minor version too.
+set(PACKAGE_VERSION "@VERSION@")
+string(REPLACE "." ";" _mpegts_parts "${PACKAGE_VERSION}")
+list(GET _mpegts_parts 0 _mpegts_major)
+list(GET _mpegts_parts 1 _mpegts_minor)
+
+if(NOT PACKAGE_FIND_VERSION)
+  set(PACKAGE_VERSION_COMPATIBLE TRUE)
+elseif(PACKAGE_FIND_VERSION VERSION_GREATER PACKAGE_VERSION)
+  set(PACKAGE_VERSION_COMPATIBLE FALSE)
+elseif(NOT PACKAGE_FIND_VERSION_MAJOR EQUAL _mpegts_major)
+  set(PACKAGE_VERSION_COMPATIBLE FALSE)
+elseif(_mpegts_major EQUAL 0 AND NOT PACKAGE_FIND_VERSION_MINOR EQUAL _mpegts_minor)
+  set(PACKAGE_VERSION_COMPATIBLE FALSE)
+else()
+  set(PACKAGE_VERSION_COMPATIBLE TRUE)
+  if(PACKAGE_FIND_VERSION VERSION_EQUAL PACKAGE_VERSION)
+    set(PACKAGE_VERSION_EXACT TRUE)
+  endif()
+endif()
+
+unset(_mpegts_parts)
+unset(_mpegts_major)
+unset(_mpegts_minor)

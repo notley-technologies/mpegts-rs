@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: mpegts
+Description: MPEG transport stream analyser and demultiplexer
+Version: @VERSION@
+Libs: -L${libdir} -lmpegts
+Libs.private: @NATIVE_LIBS@
+Cflags: -I${includedir}
