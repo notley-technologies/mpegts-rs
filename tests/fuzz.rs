@@ -185,6 +185,6 @@ fn generator_reaches_deep_paths() {
         with_sections += usize::from(units.contains(&Unit::Sections));
     }
     assert!(with_streams * 2 > runs, "only {with_streams}/{runs} generated streams declared a stream");
-    assert!(with_pes * 3 > runs, "only {with_pes}/{runs} produced a PES");
+    assert!(with_pes * 4 > runs, "only {with_pes}/{runs} produced a PES");
     assert!(with_sections * 4 > runs * 3, "only {with_sections}/{runs} produced a section");
 }

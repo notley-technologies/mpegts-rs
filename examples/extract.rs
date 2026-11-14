@@ -11,6 +11,8 @@
 //!                 (PES: the payload after the PES header; otherwise the
 //!                 whole packet or section). Summary goes to stderr.
 //! --history N     keep N packets and replay them into the subscription
+//! --strip-mau     remove the metadata access unit cell headers from sync
+//!                 KLV, so both kinds of KLV come out as plain KLV
 //! --verbose       one line per output on stderr
 //!
 //! Pipe KLV into another tool:
@@ -21,7 +23,7 @@ use std::io::Write;
 use std::{env, fs, io, process};
 
 fn usage(msg: &str) -> ! {
-    eprintln!("{msg}\nusage: extract FILE [--select klv|video|audio|metadata|psi|all|pid=N|program=N] [--unit pes|packets|sections] [--out PATH|-] [--history N] [--verbose]");
+    eprintln!("{msg}\nusage: extract FILE [--select klv|video|audio|metadata|psi|all|pid=N|program=N] [--unit pes|packets|sections] [--out PATH|-] [--history N] [--strip-mau] [--verbose]");
     process::exit(2);
 }
 
@@ -40,6 +42,7 @@ fn main() {
     let mut out_path = None;
     let mut history = 0;
     let mut verbose = false;
+    let mut strip_mau = false;
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage("missing value"));
@@ -56,6 +59,7 @@ fn main() {
             "--out" => out_path = Some(value()),
             "--history" => history = value().parse().unwrap_or_else(|_| usage("--history needs a number")),
             "--verbose" => verbose = true,
+            "--strip-mau" => strip_mau = true,
             f if !f.starts_with('-') && file.is_none() => file = Some(f.to_string()),
             other => usage(&format!("unknown argument {other}")),
         }
@@ -86,6 +90,7 @@ fn main() {
     for s in selects {
         let mut sub = Subscription::new(s, unit);
         sub.replay = history > 0;
+        sub.strip_metadata_au = strip_mau;
         demux.subscribe(sub).unwrap_or_else(|e| usage(&e.to_string()));
     }
 

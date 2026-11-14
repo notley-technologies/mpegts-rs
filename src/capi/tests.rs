@@ -45,7 +45,7 @@ fn new_demuxer(config: Option<&mpegts_config>) -> *mut mpegts_demuxer {
 }
 
 fn subscribe(d: *mut mpegts_demuxer, select: u32, value: u32, unit: u32) -> u32 {
-    let sub = mpegts_subscription { struct_size: 20, select, value, unit, replay: 0 };
+    let sub = mpegts_subscription { struct_size: 20, select, value, unit, replay: 0, strip_metadata_au: 0 };
     let mut id = 0;
     assert_eq!(unsafe { mpegts_demuxer_subscribe(d, &sub, &mut id) }, MPEGTS_OK);
     id
@@ -155,7 +155,7 @@ fn null_pointers_are_rejected() {
         assert_eq!(mpegts_demuxer_push(d, ptr::null(), 0), MPEGTS_OK);
         assert_eq!(mpegts_demuxer_next_output(d, ptr::null_mut()), MPEGTS_ERR_NULL);
         assert_eq!(mpegts_demuxer_subscribe(d, ptr::null(), &mut 0), MPEGTS_ERR_NULL);
-        let sub = mpegts_subscription { struct_size: 20, select: 6, value: 0, unit: 1, replay: 0 };
+        let sub = mpegts_subscription { struct_size: 20, select: 6, value: 0, unit: 1, replay: 0, strip_metadata_au: 0 };
         assert_eq!(mpegts_demuxer_subscribe(d, &sub, ptr::null_mut()), MPEGTS_ERR_NULL);
         assert_eq!(mpegts_demuxer_history_get(d, 0, ptr::null_mut(), ptr::null_mut()), MPEGTS_ERR_NULL);
         mpegts_demuxer_free(d);
@@ -168,10 +168,10 @@ fn invalid_arguments_are_rejected() {
         let d = new_demuxer(None);
         let mut id = 0;
         for (select, value, unit) in [(1, 0x2000, 1), (3, 0xDEAD, 2), (4, 99, 2), (9, 0, 1), (6, 0, 0), (6, 0, 4), (2, 0x10000, 1)] {
-            let sub = mpegts_subscription { struct_size: 20, select, value, unit, replay: 0 };
+            let sub = mpegts_subscription { struct_size: 20, select, value, unit, replay: 0, strip_metadata_au: 0 };
             assert_eq!(mpegts_demuxer_subscribe(d, &sub, &mut id), MPEGTS_ERR_INVALID, "{select} {value} {unit}");
         }
-        let bad_size = mpegts_subscription { struct_size: 2, select: 6, value: 0, unit: 1, replay: 0 };
+        let bad_size = mpegts_subscription { struct_size: 2, select: 6, value: 0, unit: 1, replay: 0, strip_metadata_au: 0 };
         assert_eq!(mpegts_demuxer_subscribe(d, &bad_size, &mut id), MPEGTS_ERR_INVALID);
         mpegts_demuxer_free(d);
 
@@ -259,7 +259,7 @@ fn history_and_replay() {
         assert_eq!(mpegts_demuxer_history_get(d, 0, &mut packet, &mut p), MPEGTS_OK);
         assert_eq!((packet, slice::from_raw_parts(p, 188)), (1, &data[..188]));
         assert_eq!(mpegts_demuxer_history_get(d, n, &mut packet, &mut p), MPEGTS_ERR_RANGE);
-        let sub = mpegts_subscription { struct_size: 20, select: 3, value: Codec::KlvAsync.code(), unit: 2, replay: 1 };
+        let sub = mpegts_subscription { struct_size: 20, select: 3, value: Codec::KlvAsync.code(), unit: 2, replay: 1, strip_metadata_au: 0 };
         let mut id = 0;
         assert_eq!(mpegts_demuxer_subscribe(d, &sub, &mut id), MPEGTS_OK);
         assert_eq!(drain(d).len(), 3, "all KLV from before the subscription");
@@ -354,4 +354,41 @@ fn config_check_explains_rejections() {
         assert_eq!(created, check(&c, 128).0);
         unsafe { mpegts_demuxer_free(d) };
     }
+}
+
+#[test]
+fn strip_metadata_au_from_c() {
+    let mut ts = Ts::new();
+    ts.section(0, &pat(1, 0, &[(1, 0x1000)]));
+    ts.section(0x1000, &pmt(1, 0, 0x103, &[], &[(METADATA, 0x103, metadata_descriptor(b"KLVA"))]));
+    let mut au = vec![0x00, 0x00, 0xDF, 0x00, KLV_KEY.len() as u8];
+    au.extend_from_slice(&KLV_KEY);
+    ts.pes(0x103, 0xFC, Some(9), &au);
+    let payload_for = |strip: u32, struct_size: u32| {
+        let d = new_demuxer(None);
+        let sub = mpegts_subscription {
+            struct_size,
+            select: 3,
+            value: Codec::KlvSync.code(),
+            unit: 2,
+            replay: 0,
+            strip_metadata_au: strip,
+        };
+        let mut id = 0;
+        unsafe {
+            assert_eq!(mpegts_demuxer_subscribe(d, &sub, &mut id), MPEGTS_OK);
+            mpegts_demuxer_push(d, ts.out.as_ptr(), ts.out.len());
+            mpegts_demuxer_finish(d);
+        }
+        let outs = drain(d);
+        unsafe { mpegts_demuxer_free(d) };
+        assert_eq!(outs.len(), 1);
+        let (o, data) = &outs[0];
+        data[o.payload_offset as usize..].to_vec()
+    };
+    let full = mem::size_of::<mpegts_subscription>() as u32;
+    assert_eq!(payload_for(1, full), KLV_KEY.to_vec());
+    assert_eq!(payload_for(0, full), au);
+    // A caller built against the older, shorter struct gets the default.
+    assert_eq!(payload_for(1, 20), au);
 }

@@ -60,17 +60,29 @@ pub struct Subscription {
     /// Start by replaying matching packets from the history (see
     /// [`Config::history_packets`]).
     pub replay: bool,
+    /// For PES from metadata streams (stream_id 0xFC, e.g. sync KLV),
+    /// remove the 5-byte metadata access unit cell headers (ISO/IEC
+    /// 13818-1 2.12.4) so the payload is just the metadata, cells joined
+    /// in order. Off by default: the payload is delivered as carried.
+    pub strip_metadata_au: bool,
 }
 
 impl Subscription {
     /// Follow `select`, delivering `unit`, from now on.
     pub fn new(select: Select, unit: Unit) -> Self {
-        Subscription { select, unit, replay: false }
+        Subscription { select, unit, replay: false, strip_metadata_au: false }
     }
 
     /// Also deliver matching data still held in the packet history.
     pub fn with_replay(mut self) -> Self {
         self.replay = true;
+        self
+    }
+
+    /// Deliver metadata stream PES without their access unit cell headers
+    /// (see [`strip_metadata_au`](Self::strip_metadata_au)).
+    pub fn strip_metadata_au(mut self) -> Self {
+        self.strip_metadata_au = true;
         self
     }
 }
@@ -237,7 +249,8 @@ impl PesAsm {
     }
 
     /// Hand the assembled PES to the queue.
-    fn emit(&mut self, id: SubscriptionId, pid: u16, queue: &mut Queue, budget: &mut Budget) {
+    fn emit(&mut self, sub: (SubscriptionId, bool), pid: u16, queue: &mut Queue, budget: &mut Budget) {
+        let (id, strip) = sub;
         let short = !self.truncated && self.declared_len().is_some_and(|n| self.buf.len() < n);
         budget.used -= self.buf.len();
         let data = std::mem::replace(&mut self.buf, queue.take_buf());
@@ -246,6 +259,9 @@ impl PesAsm {
         out.damaged = self.damaged || short;
         out.truncated = self.truncated;
         describe_pes(&mut out);
+        if strip && out.stream_id == Some(METADATA_STREAM_ID) {
+            strip_metadata_au(&mut out);
+        }
         queue.push(out);
     }
 
@@ -255,6 +271,34 @@ impl PesAsm {
         self.buf.clear();
         self.active = false;
     }
+}
+
+/// stream_id of a metadata_stream, whose payload is metadata access unit
+/// cells.
+const METADATA_STREAM_ID: u8 = 0xFC;
+
+/// Replace the access unit cells after the PES header with their data.
+/// Each cell is metadata_service_id, sequence_number, a flags byte and a
+/// 16-bit AU_cell_data_length, then that many bytes. A cell that runs past
+/// the end, or trailing bytes too short for a header, mark the output
+/// damaged; whatever data is present is kept.
+fn strip_metadata_au(out: &mut Output) {
+    let d = &mut out.data;
+    let (mut read, mut write) = (out.payload_offset, out.payload_offset);
+    while read < d.len() {
+        if d.len() - read < 5 {
+            out.damaged = true;
+            break;
+        }
+        let len = usize::from(u16::from_be_bytes([d[read + 3], d[read + 4]]));
+        let from = read + 5;
+        let n = len.min(d.len() - from);
+        out.damaged |= n < len;
+        d.copy_within(from..from + n, write);
+        write += n;
+        read = from + n;
+    }
+    d.truncate(write);
 }
 
 /// Fill in stream_id, timestamps and payload offset from the PES header.
@@ -423,7 +467,7 @@ impl Outputs {
         sub.matched[usize::from(pid)] = unit;
         if let Some(Assembly::Pes(mut pes)) = sub.asm.remove(&pid) {
             if pes.active {
-                pes.emit(sub.id, pid, &mut self.queue, &mut self.budget);
+                pes.emit((sub.id, sub.spec.strip_metadata_au), pid, &mut self.queue, &mut self.budget);
             }
         }
     }
@@ -487,7 +531,7 @@ impl Outputs {
             open.sort_unstable();
             for (_, pid) in open {
                 if let Some(Assembly::Pes(pes)) = sub.asm.get_mut(&pid) {
-                    pes.emit(sub.id, pid, &mut self.queue, &mut self.budget);
+                    pes.emit((sub.id, sub.spec.strip_metadata_au), pid, &mut self.queue, &mut self.budget);
                 }
             }
         }
@@ -546,6 +590,7 @@ fn deliver_to(
     flags: u8,
 ) {
     let id = sub.id;
+    let pes_sub = (id, sub.spec.strip_metadata_au);
     match unit {
         Unit::Packets => {
             let mut data = queue.take_buf();
@@ -576,7 +621,7 @@ fn deliver_to(
             }
             if v.pusi {
                 if pes.active {
-                    pes.emit(id, pid, queue, budget);
+                    pes.emit(pes_sub, pid, queue, budget);
                 }
                 pes.start(packet);
             } else if !pes.active {
@@ -587,7 +632,7 @@ fn deliver_to(
                 if pes.buf.len() >= len {
                     budget.used -= pes.buf.len() - len;
                     pes.buf.truncate(len);
-                    pes.emit(id, pid, queue, budget);
+                    pes.emit(pes_sub, pid, queue, budget);
                 }
             }
         }

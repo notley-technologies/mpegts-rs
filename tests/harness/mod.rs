@@ -175,7 +175,10 @@ fn subscription_from(a: u8, b: u8) -> Subscription {
         _ => Select::All,
     };
     let unit = [Unit::Packets, Unit::Pes, Unit::Sections][usize::from(a / 6) % 3];
-    let sub = Subscription::new(select, unit);
+    let mut sub = Subscription::new(select, unit);
+    if a & 0x40 != 0 {
+        sub = sub.strip_metadata_au();
+    }
     if a & 0x80 != 0 {
         sub.with_replay()
     } else {
@@ -463,8 +466,15 @@ impl Gen<'_, '_> {
         let t = self.input.u8();
         let pts = (t & 1 != 0).then(|| self.input.u64() & ((1 << 33) - 1));
         let dts = (t & 3 == 3).then(|| self.input.u64() & ((1 << 33) - 1));
-        let mut es = match self.input.u8() % 5 {
+        let mut es = match self.input.u8() % 6 {
             0 => KLV_KEY.to_vec(),
+            // A metadata access unit cell holding a KLV key; the bytes
+            // added below make its declared length right only sometimes.
+            5 => {
+                let mut cell = vec![self.input.u8(), self.input.u8(), 0xDF, 0, self.input.u8() % 64];
+                cell.extend_from_slice(&KLV_KEY);
+                cell
+            }
             1 => vec![0, 0, 0, 1, 0x67],
             2 => vec![0xFF, 0xF1],
             3 => vec![0x0B, 0x77],
@@ -836,6 +846,7 @@ unsafe fn capi_session(ops: &mut Input<'_>, ts: &[u8]) {
                     },
                     unit: u32::from(ops.u8() % 5),
                     replay: u32::from(ops.bool()),
+                    strip_metadata_au: u32::from(ops.bool()),
                 };
                 let mut id = 0;
                 let status = mpegts_demuxer_subscribe(d, &sub, &mut id);

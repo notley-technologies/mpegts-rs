@@ -42,7 +42,9 @@ static mpegts_status drain(mpegts_demuxer *d) {
 
 int main(int argc, char **argv) {
     mpegts_demuxer *d = NULL;
-    mpegts_subscription sub = {sizeof(mpegts_subscription), MPEGTS_SELECT_CODEC, 0, MPEGTS_UNIT_PES, 0};
+    /* strip_metadata_au = 1: sync KLV comes without its access unit cell
+     * headers, so both kinds of KLV arrive as plain KLV. */
+    mpegts_subscription sub = {sizeof(mpegts_subscription), MPEGTS_SELECT_CODEC, 0, MPEGTS_UNIT_PES, 0, 1};
     unsigned char buf[1316]; /* one UDP datagram's worth */
     uint32_t id;
     size_t n;
