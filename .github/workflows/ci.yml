@@ -91,3 +91,22 @@ jobs:
         with:
           name: fuzz-${{ matrix.target }}
           path: fuzz/artifacts
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v4
+
+  # One check for branch protection to require, instead of every job.
+  ci-result:
+    name: CI result
+    if: always()
+    needs: [test, warnings, msrv, c-package-macos, fuzz]
+    runs-on: ubuntu-latest
+    steps:
+      - name: all jobs passed
+        run: |
+          echo '${{ toJSON(needs) }}'
+          test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = false
