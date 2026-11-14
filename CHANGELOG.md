@@ -9,5 +9,6 @@ All notable changes to this project are documented here. The format follows [Kee
 - Stream analysis: programs, elementary streams, codec identification (including sync and async KLV), timing, continuity and error counters, for whole buffers and live feeds.
 - Extraction of raw packets, PES packets and sections from any stream or table, with bounded, configurable buffers and packet history replay.
 - Stable C ABI (`include/mpegts.h`, ABI version 1) with `make install`, pkg-config and CMake support.
+- `Subscription::strip_metadata_au` (C: `mpegts_subscription.strip_metadata_au`) to deliver sync KLV without its metadata access unit cell headers.
 - Fuzz harnesses for the stable toolchain and cargo-fuzz.
 - Examples: `tsinfo`, `extract`, `json`, `throughput` and the C `klv_dump`.

@@ -159,6 +159,10 @@ typedef struct mpegts_subscription {
     uint32_t value;  /* see MPEGTS_SELECT_* */
     uint32_t unit;   /* MPEGTS_UNIT_* */
     uint32_t replay; /* non-zero: first deliver matching data from the history */
+    uint32_t strip_metadata_au; /* non-zero: PES from metadata streams (stream_id
+                                 * 0xFC, e.g. sync KLV) without their 5-byte
+                                 * access unit cell headers, so the payload is
+                                 * just the metadata. Default 0: as carried. */
 } mpegts_subscription;
 
 /* mpegts_output.flags */

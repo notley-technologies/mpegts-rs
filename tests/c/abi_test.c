@@ -37,6 +37,7 @@ static void layout(void) {
     F(mpegts_subscription, value)
     F(mpegts_subscription, unit)
     F(mpegts_subscription, replay)
+    F(mpegts_subscription, strip_metadata_au)
     F(mpegts_output, struct_size)
     F(mpegts_output, subscription)
     F(mpegts_output, unit)
@@ -153,8 +154,8 @@ static void drain(mpegts_demuxer *d) {
 int main(int argc, char **argv) {
     mpegts_config config;
     mpegts_demuxer *d = NULL;
-    mpegts_subscription klv = {sizeof(mpegts_subscription), MPEGTS_SELECT_CODEC, MPEGTS_CODEC_KLV_ASYNC, MPEGTS_UNIT_PES, 0};
-    mpegts_subscription tables = {sizeof(mpegts_subscription), MPEGTS_SELECT_PSI, 0, MPEGTS_UNIT_SECTIONS, 0};
+    mpegts_subscription klv = {sizeof(mpegts_subscription), MPEGTS_SELECT_CODEC, MPEGTS_CODEC_KLV_ASYNC, MPEGTS_UNIT_PES, 0, 0};
+    mpegts_subscription tables = {sizeof(mpegts_subscription), MPEGTS_SELECT_PSI, 0, MPEGTS_UNIT_SECTIONS, 0, 0};
     uint32_t id;
     uint8_t buf[1316];
     size_t n;

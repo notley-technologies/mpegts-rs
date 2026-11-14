@@ -58,6 +58,7 @@ pub struct mpegts_subscription {
     pub value: u32,
     pub unit: u32,
     pub replay: u32,
+    pub strip_metadata_au: u32,
 }
 
 #[repr(C)]
@@ -370,6 +371,7 @@ impl mpegts_subscription {
         };
         let mut sub = Subscription::new(select, unit);
         sub.replay = self.replay != 0;
+        sub.strip_metadata_au = self.strip_metadata_au != 0;
         Ok(sub)
     }
 }

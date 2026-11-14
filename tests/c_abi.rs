@@ -167,6 +167,7 @@ fn rust_layout() -> Vec<(String, usize)> {
         field!(mpegts_subscription, value),
         field!(mpegts_subscription, unit),
         field!(mpegts_subscription, replay),
+        field!(mpegts_subscription, strip_metadata_au),
         field!(mpegts_output, struct_size),
         field!(mpegts_output, subscription),
         field!(mpegts_output, unit),

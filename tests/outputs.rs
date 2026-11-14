@@ -123,6 +123,58 @@ fn sync_klv_access_units() {
     assert_eq!(out[0].payload(), &au[..], "cell header and KLV, untouched");
 }
 
+/// A metadata access unit cell: service id, sequence number, flags, length.
+fn cell(seq: u8, data: &[u8]) -> Vec<u8> {
+    let mut c = vec![0x00, seq, 0xDF];
+    c.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    c.extend_from_slice(data);
+    c
+}
+
+#[test]
+fn sync_klv_without_access_unit_headers_on_request() {
+    let mut ts = Ts::new();
+    tables(&mut ts);
+    let au = [cell(0, &klv(1)), cell(1, &klv(2))].concat();
+    ts.pes(0x103, 0xFC, Some(42), &au);
+    ts.pes(0x102, 0xBD, Some(43), &klv(3));
+
+    let mut d = Demuxer::new();
+    d.subscribe(Subscription::new(Select::Kind(StreamKind::Metadata), Unit::Pes).strip_metadata_au()).unwrap();
+    d.subscribe(Subscription::new(Select::Kind(StreamKind::Metadata), Unit::Pes)).unwrap();
+    let out = run(&mut d, &ts.out);
+    let (stripped, kept): (Vec<_>, Vec<_>) = out.iter().partition(|o| o.subscription.get() == 1);
+
+    let sync = stripped.iter().find(|o| o.pid == 0x103).unwrap();
+    assert_eq!(sync.payload(), &[klv(1), klv(2)].concat()[..], "cells joined, headers gone");
+    assert_eq!((sync.pts, sync.damaged), (Some(42), false));
+    assert_eq!(&sync.data[..3], &[0, 0, 1], "PES header kept");
+    let async_klv = stripped.iter().find(|o| o.pid == 0x102).unwrap();
+    assert_eq!(async_klv.payload(), &klv(3)[..], "async KLV has no cells to strip");
+    assert_eq!(kept.iter().find(|o| o.pid == 0x103).unwrap().payload(), &au[..], "the default keeps them");
+}
+
+#[test]
+fn malformed_access_unit_cells_are_flagged() {
+    // Second cell claims more data than the PES holds, then stray bytes.
+    let mut short = cell(0, &klv(1));
+    short.extend([0x00, 0x01, 0xDF, 0x00, 50]);
+    short.extend(&klv(2));
+    let mut stray = cell(0, &klv(1));
+    stray.extend([0x00, 0x01]);
+    for (payload, kept) in [(short, [klv(1), klv(2)].concat()), (stray, klv(1))] {
+        let mut ts = Ts::new();
+        tables(&mut ts);
+        ts.pes(0x103, 0xFC, Some(7), &payload);
+        let mut d = Demuxer::new();
+        d.subscribe(Subscription::new(Select::Codec(Codec::KlvSync), Unit::Pes).strip_metadata_au()).unwrap();
+        let out = run(&mut d, &ts.out);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].damaged);
+        assert_eq!(out[0].payload(), &kept[..], "data that is present is kept");
+    }
+}
+
 #[test]
 fn table_sections_with_crc_check() {
     let mut ts = Ts::new();
