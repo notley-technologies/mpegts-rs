@@ -81,7 +81,7 @@ for out in demux.outputs() {
 
 Units are `Packets` (raw 188-byte packets, damaged ones included), `Pes` (reassembled, with PTS/DTS) and `Sections` (with a CRC check). Selections follow the tables as they change, so a KLV stream that appears mid-feed is picked up. Outputs flag `damaged` (data lost inside) and `truncated` (hit a size limit).
 
-Sync KLV is carried in metadata access units, with a 5-byte cell header before each KLV unit. By default the payload is delivered as carried; add `.strip_metadata_au()` to a subscription (or set `strip_metadata_au` in C) to receive plain KLV, cells joined in order. Async KLV is plain KLV either way.
+Sync KLV is carried in metadata access units, with a 5-byte cell header before each KLV unit. By default the payload is delivered as carried; add `.strip_metadata_au()` to a subscription (or set `strip_metadata_au` in C) to receive plain KLV, cells joined in order. A payload that is not valid cells is passed through untouched and marked `damaged`. Async KLV is plain KLV either way.
 
 ## Configuration
 

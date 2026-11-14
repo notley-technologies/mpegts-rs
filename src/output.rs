@@ -63,7 +63,8 @@ pub struct Subscription {
     /// For PES from metadata streams (stream_id 0xFC, e.g. sync KLV),
     /// remove the 5-byte metadata access unit cell headers (ISO/IEC
     /// 13818-1 2.12.4) so the payload is just the metadata, cells joined
-    /// in order. Off by default: the payload is delivered as carried.
+    /// in order. A payload that is not valid cells is left untouched and
+    /// marked damaged. Off by default: the payload is delivered as carried.
     pub strip_metadata_au: bool,
 }
 
@@ -279,24 +280,26 @@ const METADATA_STREAM_ID: u8 = 0xFC;
 
 /// Replace the access unit cells after the PES header with their data.
 /// Each cell is metadata_service_id, sequence_number, a flags byte and a
-/// 16-bit AU_cell_data_length, then that many bytes. A cell that runs past
-/// the end, or trailing bytes too short for a header, mark the output
-/// damaged; whatever data is present is kept.
+/// 16-bit AU_cell_data_length, then that many bytes. Only a payload that
+/// is entirely valid cells is changed; anything else is left exactly as
+/// received and marked damaged, so bytes are never altered on a guess.
 fn strip_metadata_au(out: &mut Output) {
+    let cell_len = |d: &[u8], at: usize| usize::from(u16::from_be_bytes([d[at + 3], d[at + 4]]));
     let d = &mut out.data;
+    let mut at = out.payload_offset;
+    while at < d.len() {
+        if d.len() - at < 5 || cell_len(d, at) > d.len() - at - 5 {
+            out.damaged = true;
+            return;
+        }
+        at += 5 + cell_len(d, at);
+    }
     let (mut read, mut write) = (out.payload_offset, out.payload_offset);
     while read < d.len() {
-        if d.len() - read < 5 {
-            out.damaged = true;
-            break;
-        }
-        let len = usize::from(u16::from_be_bytes([d[read + 3], d[read + 4]]));
-        let from = read + 5;
-        let n = len.min(d.len() - from);
-        out.damaged |= n < len;
-        d.copy_within(from..from + n, write);
-        write += n;
-        read = from + n;
+        let len = cell_len(d, read);
+        d.copy_within(read + 5..read + 5 + len, write);
+        write += len;
+        read += 5 + len;
     }
     d.truncate(write);
 }
