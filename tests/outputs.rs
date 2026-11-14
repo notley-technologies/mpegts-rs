@@ -155,14 +155,15 @@ fn sync_klv_without_access_unit_headers_on_request() {
 }
 
 #[test]
-fn malformed_access_unit_cells_are_flagged() {
-    // Second cell claims more data than the PES holds, then stray bytes.
-    let mut short = cell(0, &klv(1));
-    short.extend([0x00, 0x01, 0xDF, 0x00, 50]);
-    short.extend(&klv(2));
+fn payloads_that_are_not_valid_cells_are_left_alone() {
+    // A cell longer than the PES, stray bytes after the last cell, and bare
+    // KLV on a metadata stream (cells missing altogether).
+    let mut too_long = cell(0, &klv(1));
+    too_long.extend([0x00, 0x01, 0xDF, 0x00, 50]);
+    too_long.extend(&klv(2));
     let mut stray = cell(0, &klv(1));
     stray.extend([0x00, 0x01]);
-    for (payload, kept) in [(short, [klv(1), klv(2)].concat()), (stray, klv(1))] {
+    for payload in [too_long, stray, klv(3)] {
         let mut ts = Ts::new();
         tables(&mut ts);
         ts.pes(0x103, 0xFC, Some(7), &payload);
@@ -171,7 +172,7 @@ fn malformed_access_unit_cells_are_flagged() {
         let out = run(&mut d, &ts.out);
         assert_eq!(out.len(), 1);
         assert!(out[0].damaged);
-        assert_eq!(out[0].payload(), &kept[..], "data that is present is kept");
+        assert_eq!(out[0].payload(), &payload[..], "untouched");
     }
 }
 
