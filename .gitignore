@@ -1,0 +1,11 @@
+/target
+
+# Transport stream captures used for local testing stay out of the repo.
+*.ts
+*.m2ts
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

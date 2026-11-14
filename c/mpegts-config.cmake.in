@@ -1,0 +1,23 @@
+# CMake package for mpegts, installed by `make install`.
+#
+#   find_package(mpegts 0.1 REQUIRED)
+#   target_link_libraries(app PRIVATE mpegts::mpegts)         # shared
+#   target_link_libraries(app PRIVATE mpegts::mpegts_static)  # static
+
+if(TARGET mpegts::mpegts)
+  return()
+endif()
+
+add_library(mpegts::mpegts SHARED IMPORTED)
+set_target_properties(mpegts::mpegts PROPERTIES
+  IMPORTED_LOCATION "@LIBDIR@/@SHARED@"
+  IMPORTED_SONAME "@SHARED@"
+  INTERFACE_INCLUDE_DIRECTORIES "@INCLUDEDIR@")
+
+# The static library includes the Rust standard library, which needs these
+# system libraries.
+add_library(mpegts::mpegts_static STATIC IMPORTED)
+set_target_properties(mpegts::mpegts_static PROPERTIES
+  IMPORTED_LOCATION "@LIBDIR@/libmpegts.a"
+  INTERFACE_INCLUDE_DIRECTORIES "@INCLUDEDIR@"
+  INTERFACE_LINK_LIBRARIES "@NATIVE_LIBS_CMAKE@")
