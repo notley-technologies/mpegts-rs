@@ -185,6 +185,10 @@ cargo +nightly fuzz run demux fuzz/corpus/demux my-captures/   # seed with real 
 
 The stable runner saves a failing input under `target/fuzz-failures/`. Once it is fixed, add the input to `tests/fuzz_regressions/<target>/` so every test run replays it.
 
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Report security problems privately as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 Copyright 2026 Notley Technologies and Noah Davis.

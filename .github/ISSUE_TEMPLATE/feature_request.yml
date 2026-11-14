@@ -1,0 +1,21 @@
+name: Feature request
+description: A stream type to identify, a field to report, or an API addition.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you need
+      description: The problem you are trying to solve, and what you would like the library to do.
+    validations:
+      required: true
+  - type: textarea
+    id: standard
+    attributes:
+      label: Standard or specification
+      description: For new stream types or descriptors, the document and section that defines them (e.g. ISO/IEC 13818-1 Table 2-34, ETSI EN 300 468, MISB ST 1402).
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Anything you have tried or considered instead.

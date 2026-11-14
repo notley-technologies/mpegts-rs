@@ -1,0 +1,50 @@
+name: Bug report
+description: Something is reported wrong, missed, or the library crashes or misbehaves.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For security problems (crashes or memory growth on hostile input, memory safety in the C API), please use the Security tab instead of a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Crate version or commit.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: api
+    attributes:
+      label: API
+      options:
+        - Rust
+        - C
+        - Example tool (tsinfo, extract, ...)
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What the library reported or did, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Code, commands, and how the input was fed (whole buffer or chunks, chunk size).
+      render: rust
+  - type: textarea
+    id: input
+    attributes:
+      label: Input
+      description: |
+        If you can share it, attach a short capture that shows the problem (`head -c 500000 capture.ts > sample.ts`), or describe the stream: source, encoder, stream types.
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: Ubuntu 24.04, x86_64, Rust 1.83
