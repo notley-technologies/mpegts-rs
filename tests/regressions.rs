@@ -3,7 +3,7 @@ mod common;
 
 use common::*;
 use mpegts::{analyze, Basis, Codec, Config, Demuxer, StreamKind};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// PMT long enough to need three packets.
 fn three_packet_pmt() -> Vec<u8> {
@@ -190,8 +190,13 @@ fn scrambled_pes_payload_is_not_sniffed() {
     assert_eq!(r.stream(0x101).unwrap().codec, Codec::PrivateData);
 }
 
+/// The largest PAT the syntax allows, with PCR packets on a PID many of its
+/// programs could reference. No time limit is asserted (tests never
+/// measure the real clock): a superlinear regression shows up as this test
+/// taking minutes instead of a second, and speed is measured by the
+/// ignored throughput benchmarks.
 #[test]
-fn hostile_pat_is_handled_quickly() {
+fn hostile_pat_is_handled() {
     // 256 sections x 253 programs: the largest PAT the syntax allows.
     let sections = |version: u8| -> Vec<Vec<u8>> {
         (0..=255u16)
@@ -211,12 +216,9 @@ fn hostile_pat_is_handled_quickly() {
     for i in 0..20_000u64 {
         ts.pcr(0x100, i * 2_700_000);
     }
-    let start = Instant::now();
     let r = analyze(&ts.out);
-    let took = start.elapsed();
     assert_eq!(r.programs.len(), 256 * 253);
     assert_eq!(r.pat_version, Some(3));
-    assert!(took < Duration::from_secs(20), "took {took:?}");
 }
 
 #[test]
