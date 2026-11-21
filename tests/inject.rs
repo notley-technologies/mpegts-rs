@@ -706,10 +706,9 @@ fn pmt_pid_change_mid_stream() {
         "the KLV PID stays"
     );
     // The checker follows the new PMT PID; the KLV stream continues.
-    let mut e = expect(&r, &cfg);
+    let e = expect(&r, &cfg);
     let c = check(&r.out, &e);
     assert!(c.errors.is_empty(), "{:#?}", c.errors);
-    e.pmt_pid = 0x1000;
     let before: Vec<Vec<u8>> = pmt_sections(&r.out, 0x1100);
     assert!(!before.is_empty());
     assert_eq!(read_back(&r.out, 0x101).len(), 90);
