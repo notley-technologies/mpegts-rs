@@ -6,8 +6,8 @@
  *  - Functions return an mpegts_status (0 on success, negative on error)
  *    unless documented otherwise. They never abort or unwind into C; an
  *    internal panic is reported as MPEGTS_ERR_PANIC and the demuxer (or
- *    program tables or PES writer) is then unusable (MPEGTS_ERR_POISONED)
- *    and must be freed.
+ *    program tables, PES writer or injector) is then unusable
+ *    (MPEGTS_ERR_POISONED) and must be freed.
  *  - Every pointer argument is checked for NULL.
  *  - Structs that cross the boundary start with `struct_size`. Set it to
  *    sizeof(the struct) before passing it in. The library reads or writes
@@ -17,7 +17,7 @@
  *  - A demuxer is not thread-safe: use each one from one thread at a time
  *    (it may move between threads). Separate demuxers are independent. A
  *    report never changes, so any number of threads may read one at once.
- *    Program tables and PES writers follow the demuxer's rule.
+ *    Program tables, PES writers and injectors follow the demuxer's rule.
  *  - Pointers returned into a demuxer or report stay valid until the call
  *    documented for them, or until the object is freed. Strings returned
  *    by the library are static.
@@ -27,6 +27,11 @@
  *    it. A buffer that is too small is left untouched and nothing changes
  *    (no continuity counter, sequence number or version moves). `out` may
  *    be NULL only when capacity is 0.
+ *  - Functions that produce a stream of unknown length (the injector) hand
+ *    it to a caller callback instead, whole 188-byte packets at a time,
+ *    before they return. Callbacks must return normally (no longjmp) and
+ *    must not call back into the object that called them, except through
+ *    the handle they are given.
  *
  * Compatibility: within one MPEGTS_ABI_VERSION, functions, constants and
  * struct fields are only ever added (fields at the end), never changed.
@@ -64,6 +69,9 @@ typedef int32_t mpegts_status;
 #define MPEGTS_ERR_PANIC (-5)     /* internal error; the object is poisoned */
 #define MPEGTS_ERR_POISONED (-6)  /* the object failed earlier; free it */
 #define MPEGTS_ERR_BUFFER (-7)    /* output buffer too small; see *written */
+#define MPEGTS_ERR_FULL (-8)      /* a queue is full; try again after more input */
+#define MPEGTS_ERR_STREAM (-9)    /* the input cannot be processed as configured; the
+                                   * object is unusable (see its _error function) */
 
 /* ------------------------------------------------------------ codes */
 
@@ -544,6 +552,227 @@ mpegts_status mpegts_pes_writer_set_sequence_number(mpegts_pes_writer *writer, u
 
 /* A null packet (PID 0x1FFF) into packet[0..188). */
 mpegts_status mpegts_null_packet(uint8_t *packet);
+
+/* ------------------------------------------------------------ injection
+ *
+ * The KLV injector (libraries built with `mux`): copies an input transport
+ * stream through and inserts MISB ST 1402.2 KLV into one of its programs,
+ * synchronous (stream_type 0x15, a PTS per access unit) or asynchronous
+ * (stream_type 0x06). Only PID 0 (the input's PAT, resent with the
+ * injector's counter), the target PMT PID (the PMT rewritten with the KLV
+ * entry, version + 1) and the KLV PID change; PAT and PMT copies are added
+ * so neither is more than psi_interval_ms apart. Synchronous units go out
+ * in PTS order within [PTS - max_lead_ms, PTS - min_lead_ms], right before
+ * the video frame they describe. In MPEGTS_RATE_CBR_* the output has as
+ * many packets as the input: inserted packets replace null packets and the
+ * packets the injector consumes, and no packet moves. Input is held until
+ * the target's PMT is known (at most max_held_packets packets) and, for
+ * mpegts_injector_push, until each PCR interval is complete. */
+
+typedef struct mpegts_injector mpegts_injector;           /* opaque */
+typedef struct mpegts_inject_units mpegts_inject_units;   /* opaque, frame callback only */
+
+/* mpegts_inject_config.carriage */
+#define MPEGTS_INJECT_SYNC 1
+#define MPEGTS_INJECT_ASYNC 2
+/* mpegts_inject_config.existing_klv: when the target already carries KLV */
+#define MPEGTS_EXISTING_KLV_KEEP 0    /* keep it; sync joins an existing sync stream as a
+                                       * new service (ST 1402-13), else a new PID */
+#define MPEGTS_EXISTING_KLV_REPLACE 1 /* remove it (a PCR on it is kept) */
+#define MPEGTS_EXISTING_KLV_FAIL 2    /* MPEGTS_ERR_STREAM */
+/* mpegts_inject_config.rate */
+#define MPEGTS_RATE_VBR 0             /* inserted packets are added */
+#define MPEGTS_RATE_CBR_FAIL 1        /* same packet count; no room in time: MPEGTS_ERR_STREAM */
+#define MPEGTS_RATE_CBR_DROP_OLDEST 2 /* same packet count; no room: drop units, count them */
+/* mpegts_inject_config.flags */
+#define MPEGTS_INJECT_HAS_SERVICE_ID 0x01    /* use service_id (else the lowest free one) */
+#define MPEGTS_INJECT_HAS_PID 0x02           /* use pid (else a free one) */
+#define MPEGTS_INJECT_NO_FRAME_ALIGN 0x04    /* send sync units as their window opens */
+#define MPEGTS_INJECT_SYNC_REGISTRATION 0x08 /* also the "KLVA" registration_descriptor */
+
+/* Settings. Fill with mpegts_inject_config_default, then change fields. */
+typedef struct mpegts_inject_config {
+    uint32_t struct_size;
+    uint32_t flags;            /* MPEGTS_INJECT_* */
+    uint32_t program;          /* program_number, or 0: the first program with video */
+    uint32_t carriage;         /* MPEGTS_INJECT_SYNC or _ASYNC */
+    uint32_t existing_klv;     /* MPEGTS_EXISTING_KLV_* */
+    uint32_t rate;             /* MPEGTS_RATE_* */
+    uint16_t pid;              /* with MPEGTS_INJECT_HAS_PID */
+    uint8_t service_id;        /* with MPEGTS_INJECT_HAS_SERVICE_ID (sync only) */
+    uint8_t reserved;
+    uint32_t psi_interval_ms;  /* 1 to 249; default 100 */
+    uint32_t max_lead_ms;      /* at most 1000; default 990 */
+    uint32_t min_lead_ms;      /* at least 1; default 1 */
+    uint32_t fallback_lead_ms; /* send a unit whose frame has not come this close to its PTS; 50 */
+    uint32_t input_leak_rate;  /* metadata_STD_descriptor (sync): 0x3FFFFF, 0x400, 0 */
+    uint32_t buffer_size;
+    uint32_t output_leak_rate;
+    uint64_t max_queued_units; /* default 4096 */
+    uint64_t max_queued_bytes; /* default 8 MiB */
+    uint64_t max_held_packets; /* default 50,000 */
+} mpegts_inject_config;
+
+/* mpegts_inject_unit.flags */
+#define MPEGTS_INJECT_UNIT_HAS_PTS 0x01 /* required for sync, refused for async */
+
+/* One KLV unit (a whole KLV packet) to insert. The bytes are copied. */
+typedef struct mpegts_inject_unit {
+    uint32_t struct_size;
+    uint32_t flags;      /* MPEGTS_INJECT_UNIT_* */
+    uint64_t pts;        /* 90 kHz, taken modulo 2^33 */
+    const uint8_t *data; /* may be NULL when data_len is 0 (then refused) */
+    uint64_t data_len;
+} mpegts_inject_unit;
+
+/* mpegts_inject_frame.flags */
+#define MPEGTS_FRAME_HAS_DTS 0x01
+#define MPEGTS_FRAME_HAS_CLOCK 0x02
+#define MPEGTS_FRAME_RANDOM_ACCESS 0x04 /* random_access_indicator of its first packet */
+#define MPEGTS_FRAME_DISCONTINUITY 0x08 /* first frame after a time base discontinuity */
+
+/* A video frame of the target, about to be written. */
+typedef struct mpegts_inject_frame {
+    uint32_t struct_size;
+    uint32_t flags; /* MPEGTS_FRAME_* */
+    uint16_t pid;
+    uint16_t reserved;
+    uint32_t reserved2;
+    uint64_t pts;   /* 90 kHz */
+    uint64_t dts;   /* with HAS_DTS */
+    uint64_t clock; /* program clock, 27 MHz, with HAS_CLOCK */
+} mpegts_inject_frame;
+
+/* mpegts_inject_target.flags */
+#define MPEGTS_TARGET_MERGED 0x01         /* joins an existing sync KLV stream on klv_pid */
+#define MPEGTS_TARGET_HAS_SERVICE_ID 0x02
+
+/* The program written into, and how. PIDs of 0x1FFF mean none. */
+typedef struct mpegts_inject_target {
+    uint32_t struct_size;
+    uint32_t flags; /* MPEGTS_TARGET_* */
+    uint16_t program;
+    uint16_t pmt_pid;
+    uint16_t pcr_pid;
+    uint16_t video_pid;
+    uint16_t klv_pid;
+    uint8_t service_id;
+    uint8_t carriage;        /* MPEGTS_INJECT_SYNC or _ASYNC */
+    uint32_t stripped_count; /* input KLV PIDs removed (REPLACE) */
+    uint16_t stripped[8];    /* the first eight of them */
+} mpegts_inject_target;
+
+/* Counters; see the Rust documentation of InjectStats for each. */
+typedef struct mpegts_inject_stats {
+    uint32_t struct_size;
+    uint32_t reserved;
+    uint64_t packets_in;
+    uint64_t packets_out;
+    uint64_t bytes_skipped;
+    uint64_t sync_losses;
+    uint64_t held_packets;
+    uint64_t frames;
+    uint64_t units_inserted;
+    uint64_t units_queued;
+    uint64_t bytes_queued;
+    uint64_t klv_packets;
+    uint64_t psi_packets;
+    uint64_t psi_extra_packets;
+    uint64_t stripped_packets;
+    uint64_t pcr_only_packets;
+    uint64_t null_packets;
+    uint64_t free_slots;
+    uint64_t slots_filled;
+    uint64_t dropped_late;
+    uint64_t dropped_overflow;
+    uint64_t dropped_discontinuity;
+    uint64_t dropped_unplaced;
+    uint64_t late_units;
+    uint64_t psi_crc_errors;
+    uint64_t metadata_buffer_peak; /* bytes */
+    uint64_t null_bitrate;         /* bit/s */
+    uint64_t free_bitrate;         /* bit/s: CBR headroom */
+    int64_t added_bitrate;         /* bit/s */
+    uint64_t events_dropped;
+} mpegts_inject_stats;
+
+/* mpegts_inject_event.kind */
+#define MPEGTS_EVENT_TARGET_FOUND 1   /* value: program_number */
+#define MPEGTS_EVENT_TARGET_CHANGED 2 /* value: program_number */
+#define MPEGTS_EVENT_TARGET_LOST 3    /* value: program_number */
+#define MPEGTS_EVENT_DISCONTINUITY 4  /* value: first PCR of the new time base */
+#define MPEGTS_EVENT_DROPPED 5        /* code: MPEGTS_DROP_*, value: PTS, bytes: size */
+#define MPEGTS_EVENT_WARNING 6        /* code: MPEGTS_WARN_* */
+/* mpegts_inject_event.flags */
+#define MPEGTS_EVENT_HAS_PTS 0x01
+/* Drop reasons */
+#define MPEGTS_DROP_LATE 1          /* could no longer arrive before its PTS */
+#define MPEGTS_DROP_OVERFLOW 2      /* no CBR room (MPEGTS_RATE_CBR_DROP_OLDEST) */
+#define MPEGTS_DROP_DISCONTINUITY 3 /* across a time base discontinuity */
+#define MPEGTS_DROP_UNPLACED 4      /* still queued at the end */
+/* Warnings */
+#define MPEGTS_WARN_MULTI_PROGRAM_VBR 1   /* value: programs; prefer CBR */
+#define MPEGTS_WARN_SERVICE_ID_CHANGED 2  /* value: new id, bytes: old id */
+#define MPEGTS_WARN_SERVICE_ID_IN_INPUT 3 /* value: the id */
+#define MPEGTS_WARN_LATE_UNIT 4           /* value: PTS (CBR, DROP_OLDEST) */
+
+typedef struct mpegts_inject_event {
+    uint32_t struct_size;
+    uint32_t kind;  /* MPEGTS_EVENT_* */
+    uint32_t code;
+    uint32_t flags; /* MPEGTS_EVENT_* flags */
+    uint64_t value;
+    uint64_t bytes;
+} mpegts_inject_event;
+
+/* Output: whole packets, len a multiple of 188, valid during the call. */
+typedef void (*mpegts_packets_fn)(void *user, const uint8_t *packets, size_t len);
+/* Called right before the first packet of each video frame of the target is
+ * written. Units inserted through `units` (valid during the call only) can
+ * go out immediately before that frame. */
+typedef void (*mpegts_frame_fn)(void *user, const mpegts_inject_frame *frame, mpegts_inject_units *units);
+
+mpegts_status mpegts_inject_config_default(mpegts_inject_config *config);
+/* MPEGTS_OK, or MPEGTS_ERR_INVALID with the reason in `message`. */
+mpegts_status mpegts_inject_config_check(const mpegts_inject_config *config, char *message, size_t message_len);
+/* config may be NULL for the defaults. */
+mpegts_status mpegts_injector_new(const mpegts_inject_config *config, mpegts_injector **out);
+void mpegts_injector_free(mpegts_injector *injector); /* NULL is ignored */
+/* Why the last call failed (empty after a success). */
+mpegts_status mpegts_injector_error(const mpegts_injector *injector, char *message, size_t message_len);
+/* Push input bytes in any chunking. Output goes to `sink` (required) before
+ * the call returns; on_frame may be NULL. Errors other than
+ * MPEGTS_ERR_INVALID and MPEGTS_ERR_FULL are final. */
+mpegts_status mpegts_injector_push(mpegts_injector *injector, const uint8_t *data, size_t len,
+                                   mpegts_packets_fn sink, void *sink_user, mpegts_frame_fn on_frame,
+                                   void *frame_user);
+/* Push one 188-byte packet with its program clock (27 MHz; NULL: none yet),
+ * for callers that time the input themselves. Do not mix with _push. */
+mpegts_status mpegts_injector_push_packet(mpegts_injector *injector, const uint8_t *packet, const uint64_t *clock,
+                                          mpegts_packets_fn sink, void *sink_user, mpegts_frame_fn on_frame,
+                                          void *frame_user);
+/* Queue a unit. MPEGTS_ERR_FULL: the queue is full, try again after more
+ * input; MPEGTS_ERR_INVALID: the unit breaks the carriage's rules, or a
+ * sync PTS is below the last one sent. */
+mpegts_status mpegts_injector_insert(mpegts_injector *injector, const mpegts_inject_unit *unit);
+/* The same from inside the frame callback. */
+mpegts_status mpegts_inject_units_insert(mpegts_inject_units *units, const mpegts_inject_unit *unit);
+/* Program clock at the frame (MPEGTS_EMPTY before the first PCR). */
+mpegts_status mpegts_inject_units_clock(const mpegts_inject_units *units, uint64_t *clock);
+mpegts_status mpegts_inject_units_target(const mpegts_inject_units *units, mpegts_inject_target *target);
+/* End of input: flush, send what can still be placed, count the rest.
+ * Frames still held (after the last PCR) go to on_frame (may be NULL).
+ * stats may be NULL. */
+mpegts_status mpegts_injector_finish(mpegts_injector *injector, mpegts_packets_fn sink, void *sink_user,
+                                     mpegts_frame_fn on_frame, void *frame_user, mpegts_inject_stats *stats);
+mpegts_status mpegts_injector_stats(const mpegts_injector *injector, mpegts_inject_stats *stats);
+/* MPEGTS_EMPTY until the target program is chosen. */
+mpegts_status mpegts_injector_target(const mpegts_injector *injector, mpegts_inject_target *target);
+/* Program clock of the last input packet processed (MPEGTS_EMPTY before
+ * the first PCR). */
+mpegts_status mpegts_injector_clock(const mpegts_injector *injector, uint64_t *clock);
+/* The oldest event; MPEGTS_EMPTY when there is none. */
+mpegts_status mpegts_injector_pop_event(mpegts_injector *injector, mpegts_inject_event *event);
 
 #ifdef __cplusplus
 }

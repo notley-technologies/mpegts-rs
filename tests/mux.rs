@@ -726,8 +726,8 @@ fn ffprobe_reads_written_streams() {
     let dir = std::env::temp_dir().join(format!("mpegts-ffprobe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("written.ts");
-    std::fs::write(&path, &ts).unwrap();
-    let out = std::process::Command::new(&ffprobe)
+    std::fs::write(&path, ts).unwrap();
+    let out = std::process::Command::new(ffprobe)
         .args(["-v", "error", "-of", "json", "-show_streams", "-show_packets"])
         .arg(&path)
         .output()

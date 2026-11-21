@@ -11,7 +11,9 @@
 //! - the C API returns only documented status codes and never reports an
 //!   internal error;
 //! - what the write primitives write (feature `mux`) obeys the packet rules
-//!   and reads back unchanged.
+//!   and reads back unchanged;
+//! - the injector (feature `mux`) passes every packet it does not own
+//!   through unchanged, within its memory limits.
 #![allow(dead_code)]
 
 #[path = "../common/mod.rs"]
@@ -32,8 +34,17 @@ use std::mem;
 use std::ptr;
 
 #[cfg(feature = "mux")]
+pub mod check;
+#[cfg(feature = "mux")]
+mod inject;
+#[cfg(feature = "mux")]
 mod mux;
+#[cfg(feature = "mux")]
+pub mod synth;
 // Each fuzz target uses one harness; the rest is unused there.
+#[cfg(feature = "mux")]
+#[allow(unused_imports)]
+pub use inject::{inject, inject_run};
 #[cfg(feature = "mux")]
 #[allow(unused_imports)]
 pub use mux::{mux, mux_run};
@@ -89,6 +100,8 @@ pub fn capi(data: &[u8]) {
         capi_session(&mut ops, &ts);
         #[cfg(feature = "mux")]
         mux::capi_mux_session(&mut Input::new(data));
+        #[cfg(feature = "mux")]
+        inject::capi_inject_session(&mut Input::new(data));
     }
 }
 

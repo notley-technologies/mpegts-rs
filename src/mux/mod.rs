@@ -18,12 +18,17 @@
 //!   per SMPTE RP 217.
 //! - [`StreamSpec`]: what a PMT entry and its PES writer need, with the KLV
 //!   presets [`StreamSpec::klv_sync`] and [`StreamSpec::klv_async`].
+//! - [`Injector`]: built on the above, inserts KLV into an existing
+//!   transport stream as it passes through (pass-through invariant, PSI
+//!   rewrite, the T-STD insertion window, VBR or strict CBR), with
+//!   [`FrameReorder`] to give per-frame metadata presentation order.
 //!
 //! Every writer emits whole 188-byte packets into a [`PacketSink`]: a
 //! closure, a `Vec<u8>`, or a fixed buffer through [`SliceSink`]. Writing
 //! does not allocate: packets, PES headers and sections are built on the
 //! stack, so the writers suit targets without an allocator (configuring a
-//! [`StreamSpec`] or [`ProgramTables`] does allocate). A write either
+//! [`StreamSpec`] or [`ProgramTables`] does allocate; the [`Injector`]
+//! allocates its queues as it starts and then reuses them). A write either
 //! completes or, when the sink is too small, fails with
 //! [`MuxError::BufferTooSmall`] before emitting anything or changing any
 //! counter.
@@ -63,6 +68,7 @@
 
 mod cells;
 mod error;
+mod inject;
 mod pes;
 mod psi;
 mod sink;
@@ -71,6 +77,10 @@ mod ts;
 
 pub use cells::{CellFragment, CellHeader, CELL_HEADER_LEN, MAX_CELL_DATA};
 pub use error::MuxError;
+pub use inject::{
+    DropReason, ExistingKlv, Frame, FrameReorder, InjectConfig, InjectError, InjectEvent, InjectStats, InjectWarning,
+    Injector, InsertUnit, KlvCarriage, OnOverflow, ProgramSelect, RateMode, Target, Units,
+};
 pub use pes::{Carriage, PesUnit, PesWriter, MAX_ASYNC_PES_DATA};
 pub use psi::{
     write_descriptor, write_pat_section, write_pmt_section, PatEntry, PmtEntry, ProgramDef, ProgramTables,

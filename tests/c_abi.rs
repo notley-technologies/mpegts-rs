@@ -71,6 +71,8 @@ fn header_constants_match_rust() {
         ("MPEGTS_ERR_PANIC", MPEGTS_ERR_PANIC.into()),
         ("MPEGTS_ERR_POISONED", MPEGTS_ERR_POISONED.into()),
         ("MPEGTS_ERR_BUFFER", MPEGTS_ERR_BUFFER.into()),
+        ("MPEGTS_ERR_FULL", MPEGTS_ERR_FULL.into()),
+        ("MPEGTS_ERR_STREAM", MPEGTS_ERR_STREAM.into()),
         ("MPEGTS_UNIT_PACKETS", mpegts::Unit::Packets as i64),
         ("MPEGTS_UNIT_PES", mpegts::Unit::Pes as i64),
         ("MPEGTS_UNIT_SECTIONS", mpegts::Unit::Sections as i64),
@@ -112,8 +114,9 @@ fn exported_symbols_match_header() {
     }
     let exported = dynamic_symbols(&build_library().join("libmpegts.so"));
     let declared = header_functions();
-    // 29 for reading, 37 for writing (built with the `mux` feature).
-    assert_eq!(declared.len(), 66, "header functions: {declared:?}");
+    // 29 for reading, 37 for writing and 16 for injecting (built with the
+    // `mux` feature).
+    assert_eq!(declared.len(), 82, "header functions: {declared:?}");
     let missing: Vec<_> = declared.difference(&exported).collect();
     let extra: Vec<_> = exported.difference(&declared).collect();
     assert!(missing.is_empty(), "declared in the header but not exported: {missing:?}");
@@ -122,9 +125,16 @@ fn exported_symbols_match_header() {
 
 /// Write-side functions (feature `mux`).
 fn is_write_side(name: &str) -> bool {
-    ["mpegts_program_tables_", "mpegts_pes_writer_", "mpegts_stream_spec_", "mpegts_null_packet"]
-        .iter()
-        .any(|p| name.starts_with(p))
+    [
+        "mpegts_program_tables_",
+        "mpegts_pes_writer_",
+        "mpegts_stream_spec_",
+        "mpegts_null_packet",
+        "mpegts_inject_",
+        "mpegts_injector_",
+    ]
+    .iter()
+    .any(|p| name.starts_with(p))
 }
 
 fn dynamic_symbols(lib: &Path) -> BTreeSet<String> {

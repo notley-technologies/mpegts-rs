@@ -110,3 +110,56 @@ fn writing_does_not_allocate() {
     });
     assert_eq!(n, 0, "the write path allocated {n} times");
 }
+
+/// A stream for the injector: PAT and PMT every third frame, H.264 video
+/// with a PCR every frame, null padding to 60 packets a frame.
+fn injector_input(frames: u64) -> Vec<u8> {
+    let video = StreamSpec::h264();
+    let mut tables = ProgramTables::new(1);
+    tables.add_program(1, 0x1000, Some(0x100)).unwrap();
+    tables.add_stream(1, 0x100, &video).unwrap();
+    let mut writer = PesWriter::new(0x100, &video).unwrap();
+    let frame = vec![0x5Au8; 6000];
+    let mut ts = Vec::new();
+    for i in 0..frames {
+        let start = ts.len();
+        if i % 3 == 0 {
+            tables.write_all(&mut ts).unwrap();
+        }
+        let pts = 900_000 + i * 3003;
+        writer.write(&PesUnit::new(&frame).with_pts(pts).with_pcr((pts - 36_000) * 300), &mut ts).unwrap();
+        while ts.len() - start < 60 * 188 {
+            ts.extend_from_slice(&mpegts::mux::NULL_PACKET);
+        }
+    }
+    ts
+}
+
+#[test]
+fn injector_steady_state_does_not_allocate() {
+    use mpegts::mux::{Frame, InjectConfig, Injector, InsertUnit, OnOverflow, RateMode, Units};
+    let ts = injector_input(300);
+    let half = 150 * 60 * 188;
+    for cfg in [InjectConfig::default(), InjectConfig::default().with_rate(RateMode::Cbr { on_overflow: OnOverflow::Fail })]
+    {
+        let mut inj = Injector::new(cfg).unwrap();
+        let mut out = Vec::with_capacity(ts.len() * 2);
+        // The caller's units are made before counting starts.
+        let mut units: Vec<Vec<u8>> = (0..300).map(|i| vec![i as u8; 100]).collect();
+        let mut on_frame = |f: &Frame, u: &mut Units<'_>| {
+            if let Some(data) = units.pop() {
+                u.insert(InsertUnit::sync(f.pts, data)).unwrap();
+            }
+        };
+        // Warm up: the first half fills every queue and buffer once.
+        inj.push_with(&ts[..half], &mut out, &mut on_frame).unwrap();
+        let n = allocations(|| {
+            for chunk in ts[half..].chunks(1316) {
+                inj.push_with(chunk, &mut out, &mut on_frame).unwrap();
+            }
+        });
+        assert_eq!(n, 0, "the injector allocated {n} times in steady state");
+        let stats = inj.finish(&mut out).unwrap();
+        assert!(stats.units_inserted > 250, "{stats:?}");
+    }
+}

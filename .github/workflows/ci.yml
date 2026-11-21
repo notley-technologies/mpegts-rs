@@ -83,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [demux, stream, capi, mux]
+        target: [demux, stream, capi, mux, inject]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -101,6 +101,29 @@ jobs:
           name: fuzz-${{ matrix.target }}
           path: fuzz/artifacts
 
+  oracles:
+    # External validators on the injector's output (MUXING_PLAN.md 7.4):
+    # TSDuck's continuity and PCR checks and tsanalyze. The patched FFmpeg
+    # oracle (MPEGTS_FFPROBE, MPEGTS_FFMPEG) runs where it is built.
+    runs-on: ubuntu-24.04
+    env:
+      TSDUCK_VERSION: 3.45-4798
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install TSDuck from its release package
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/tsduck.deb" \
+            "https://github.com/tsduck/tsduck/releases/download/v${TSDUCK_VERSION}/tsduck_${TSDUCK_VERSION}.ubuntu24_amd64.deb"
+          sudo apt-get update
+          sudo apt-get install -y "$RUNNER_TEMP/tsduck.deb"
+          tsp --version
+      - name: injected streams through TSDuck
+        run: cargo test --features mux --test inject -- tsduck --nocapture
+        env:
+          MPEGTS_TSDUCK: /usr/bin
+
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -112,7 +135,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [test, warnings, msrv, c-package-macos, fuzz]
+    needs: [test, warnings, msrv, c-package-macos, fuzz, oracles]
     runs-on: ubuntu-latest
     steps:
       - name: all jobs passed

@@ -32,7 +32,7 @@ fn root() -> &'static Path {
 /// Saved inputs for `target`, in name order.
 fn regressions(target: &str) -> Vec<(PathBuf, Vec<u8>)> {
     let dir = root().join("tests/fuzz_regressions").join(target);
-    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(entries) => entries.map(|e| e.unwrap().path()).filter(|p| p.is_file()).collect(),
         Err(_) => return Vec::new(),
     };
@@ -164,6 +164,51 @@ fn fuzz_capi() {
 #[test]
 fn fuzz_mux() {
     fuzz("mux", harness::mux, random_seeds(&[16, 128, 1024, 4096]), 300);
+}
+
+/// Synthetic streams to mutate, each after a config byte, a style byte and
+/// a seed, with the stream selector byte of the injector harness (0: a
+/// synthetic stream).
+#[cfg(feature = "mux")]
+fn inject_seeds() -> Vec<Vec<u8>> {
+    let mut seeds = random_seeds(&[64, 512, 2048]);
+    // config (rate, carriage, existing KLV), no fixed PID, input style,
+    // seed, stream selector (multiple of 4: synthetic, with flags), frames.
+    for (config, style, stream) in [(0x18u8, 1u8, 0x00u8), (0x19, 1, 0x04), (0x00, 0, 0x14), (0x1A, 1, 0x10), (0x08, 1, 0x2C)] {
+        let mut s = vec![config, 0xFF, style, 1, 2, 3, 4, 5, 6, 7, 8, stream, 30];
+        s.extend_from_slice(&[0; 12]);
+        seeds.push(s);
+    }
+    seeds
+}
+
+#[cfg(feature = "mux")]
+#[test]
+fn fuzz_inject() {
+    fuzz("inject", harness::inject, inject_seeds(), 300);
+}
+
+/// The injector harness reaches the target and writes units on most
+/// synthetic inputs.
+#[cfg(feature = "mux")]
+#[test]
+fn inject_harness_reaches_deep_paths() {
+    let mut rng = Rng(seed());
+    let (mut targets, mut units, runs) = (0, 0, 200);
+    for _ in 0..runs {
+        let n = 64 + rng.below(512);
+        let mut data = random_bytes(&mut rng, n);
+        // VBR, sync, Keep, no tight limits, no fixed PID, a synthetic
+        // stream with random flags.
+        data[0] = 0x18;
+        data[1] = 0xFF;
+        data[11] &= !3;
+        let run = harness::inject_run(&data);
+        targets += usize::from(run.target);
+        units += usize::from(run.units > 0);
+    }
+    assert!(targets * 2 > runs, "only {targets}/{runs} runs found a target");
+    assert!(units * 4 > runs, "only {units}/{runs} runs wrote a unit");
 }
 
 /// The generator is only useful if what it builds gets past sync and

@@ -54,6 +54,10 @@ required-features = ["mux"]
 name = "mux_alloc"
 required-features = ["mux"]
 
+[[test]]
+name = "inject"
+required-features = ["mux"]
+
 [[example]]
 name = "json"
 required-features = ["serde"]

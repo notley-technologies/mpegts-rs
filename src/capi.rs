@@ -24,6 +24,8 @@ pub const MPEGTS_ERR_NOT_FOUND: i32 = -4;
 pub const MPEGTS_ERR_PANIC: i32 = -5;
 pub const MPEGTS_ERR_POISONED: i32 = -6;
 pub const MPEGTS_ERR_BUFFER: i32 = -7;
+pub const MPEGTS_ERR_FULL: i32 = -8;
+pub const MPEGTS_ERR_STREAM: i32 = -9;
 
 const OUTPUT_HAS_STREAM_ID: u32 = 0x01;
 const OUTPUT_HAS_TABLE_ID: u32 = 0x02;
@@ -308,6 +310,7 @@ impl From<&Config> for mpegts_config {
 
 impl mpegts_config {
     /// The Rust config, or why this one is invalid.
+    #[allow(clippy::field_reassign_with_default)]
     fn to_config(self) -> Result<Config, String> {
         let size = |field: &str, v: u64| usize::try_from(v).map_err(|_| format!("invalid config: {field} is too large"));
         let mut c = Config::default();
@@ -410,9 +413,12 @@ fn output_struct(o: &Output) -> mpegts_output {
     }
 }
 
+/// Codes with their names, NUL-terminated.
+type Names = Vec<(u32, CString)>;
+
 /// NUL-terminated copies of names, made once.
-fn c_names() -> &'static (Vec<(u32, CString)>, Vec<(u32, CString)>) {
-    static NAMES: OnceLock<(Vec<(u32, CString)>, Vec<(u32, CString)>)> = OnceLock::new();
+fn c_names() -> &'static (Names, Names) {
+    static NAMES: OnceLock<(Names, Names)> = OnceLock::new();
     NAMES.get_or_init(|| {
         let codecs = Codec::ALL.iter().map(|c| (c.code(), CString::new(c.name()).unwrap())).collect();
         let kinds = StreamKind::ALL.iter().map(|k| (k.code(), CString::new(k.name()).unwrap())).collect();
@@ -444,6 +450,8 @@ pub extern "C" fn mpegts_status_string(status: mpegts_status) -> *const c_char {
         MPEGTS_ERR_PANIC => "internal error\0",
         MPEGTS_ERR_POISONED => "unusable after an internal error\0",
         MPEGTS_ERR_BUFFER => "output buffer too small\0",
+        MPEGTS_ERR_FULL => "queue full; try again later\0",
+        MPEGTS_ERR_STREAM => "the input cannot be processed as configured\0",
         _ => "unknown status\0",
     };
     s.as_ptr() as *const c_char
@@ -956,6 +964,10 @@ pub unsafe extern "C" fn mpegts_report_stream_descriptor(
 mod mux;
 #[cfg(feature = "mux")]
 pub use mux::*;
+#[cfg(feature = "mux")]
+mod inject;
+#[cfg(feature = "mux")]
+pub use inject::*;
 
 #[cfg(test)]
 mod tests;

@@ -152,9 +152,46 @@ ffprobe -show_streams -show_packets out.ts
 
 On the read side, without any feature, `PacketHeader::parse` and `PesHeader::parse` decode single packets and PES headers, and `PcrTimeline` gives every packet its time on the program clock (interpolated between PCRs, continuous across clock jumps), which pass-through tools need to pace or insert packets.
 
+## Injecting KLV
+
+`mux::Injector` (feature `mux`) inserts KLV metadata into an existing transport stream as it passes through, synchronous (stream_type 0x15, a PTS per access unit) or asynchronous (stream_type 0x06, SMPTE RP 217), per MISB ST 1402.2. Every input packet goes out unchanged, in order, except:
+
+- PID 0: the input's own PAT sections, resent byte for byte with the injector's continuity counter;
+- the target program's PMT PID: the PMT rewritten with the KLV entry, its version one above the input's, a new CRC; other sections there are copied;
+- the KLV PID: the new stream, or, when the program already has synchronous KLV and `ExistingKlv::Keep` applies, the existing stream joined as a new metadata service (its continuity counters and cell sequence numbers renumbered, its access unit bytes untouched). `ExistingKlv::Replace` removes the program's KLV instead (a PCR it carries is kept); `ExistingKlv::Fail` refuses.
+
+PAT and PMT copies are added so neither is ever more than `psi_interval_ms` (default 100) apart. Synchronous units are queued by PTS and each goes out at most 990 ms and at least 1 ms before its PTS (the T-STD limit is 1 s), right before the video frame it describes; units that can no longer make it are dropped and counted. Packets are timed on the program clock by PCR interpolation. In `RateMode::Cbr` the output has exactly as many packets as the input: inserted packets replace null packets and the packets the injector consumes, no packet (so no PCR) moves, and a lack of room fails loudly (`OnOverflow::Fail`) or drops units (`OnOverflow::DropOldest`), never silently becoming VBR.
+
+```rust
+use mpegts::mux::{Frame, FrameReorder, InjectConfig, Injector, InsertUnit, Units};
+
+let mut injector = Injector::new(InjectConfig::default())?;  // sync KLV, VBR, first program with video
+let mut reorder = FrameReorder::new(16);                       // B-frames: decode order -> presentation order
+// Called right before each video frame is written; a unit inserted here can
+// go out immediately before that frame.
+let mut on_frame = |frame: &Frame, units: &mut Units<'_>| {
+    reorder.push(*frame);
+    while let Some(f) = reorder.pop() {
+        let _ = units.insert(InsertUnit::sync(f.pts, st0601_packet_for(f.pts)));
+    }
+};
+let mut out = Vec::new();
+for chunk in input_chunks {
+    injector.push_with(&chunk, &mut out, &mut on_frame)?;
+}
+let stats = injector.finish_with(&mut out, &mut on_frame)?;   // frames still held go to the callback too
+println!("{} units, {} dropped late", stats.units_inserted, stats.dropped_late);
+```
+
+- Input as bytes in any chunking (`push`, which holds each PCR interval until its closing PCR to time it) or as packets with the caller's clock (`push_packet`, for tools that pace output). Until the target program's PMT is known, input is held (`max_held_packets`) so every decision applies from the first packet.
+- `insert` queues units outside the callback; `clock()` gives the program clock of the last packet processed, so a scheduler can queue ahead for programs without video. A full queue returns `InjectError::QueueFull` for backpressure; a PTS below the last one sent is refused.
+- Refused: scrambled target programs, a PMT that would exceed 1021 bytes, a fixed PID or service id in use, no target within the hold limit. Time base discontinuities drop units that would cross them; the next `Frame` is flagged. `stats()` and `pop_event()` report counters, drops and warnings (for example VBR insertion into a multi-program stream).
+- Memory is bounded by the configuration, and the steady state does not allocate. Release-mode throughput on a synthetic 11 Mbit/s stream is about 3 GB/s with `push` and 5 GB/s with `push_packet` (`cargo test --release --features mux --test inject -- --ignored throughput --nocapture`).
+- In C: `mpegts_injector_*` in `include/mpegts.h`, with output and frame callbacks.
+
 ## C API
 
-The header is [include/mpegts.h](include/mpegts.h). Its opening comment states the rules every function follows: status codes, NULL checks, structs that carry their size so fields can be added compatibly, thread use, pointer lifetimes and output buffers. No panic crosses into C. [examples/c/klv_dump.c](examples/c/klv_dump.c) shows the usual flow. The write side is there too (`mpegts_program_tables_*`, `mpegts_pes_writer_*`), writing packets into the caller's buffer; `make` builds the library with it.
+The header is [include/mpegts.h](include/mpegts.h). Its opening comment states the rules every function follows: status codes, NULL checks, structs that carry their size so fields can be added compatibly, thread use, pointer lifetimes, output buffers and callbacks. No panic crosses into C. [examples/c/klv_dump.c](examples/c/klv_dump.c) shows the usual flow. The write side is there too (`mpegts_program_tables_*`, `mpegts_pes_writer_*`), writing packets into the caller's buffer, and the injector (`mpegts_injector_*`), writing through a callback; `make` builds the library with them.
 
 Install the shared and static libraries, the header, a pkg-config file and a CMake package:
 
@@ -213,7 +250,7 @@ Prints min, mean, median, p95, p99 and max per chunk size, in milliseconds and M
 | Feature | Default | Adds |
 |---|---|---|
 | `capi` | on | the C ABI. Without it the library is compiled with `#![forbid(unsafe_code)]`. |
-| `mux` | off | `mpegts::mux`, the write primitives, and with `capi` their C functions |
+| `mux` | off | `mpegts::mux`, the write primitives and the KLV injector, and with `capi` their C functions |
 | `serde` | off | `Serialize` for the report types |
 
 ## Tests
@@ -224,20 +261,24 @@ cargo test --all-features
 
 The C tests compile programs against the header and the shared library, check that exported symbols match the header (and that a default build exports none of the write side), write a stream from C and read it back, and run `make install` into a temporary prefix to build the example through pkg-config and CMake, shared and static. Each part is skipped when its tools are missing.
 
-The write side is also checked against FFmpeg with the KLV patch series (`ffmpeg-klv-fix`) when you point the tests at it:
+The write side and the injector are also checked against FFmpeg with the KLV patch series (`ffmpeg-klv-fix`) and against TSDuck when you point the tests at them (a wrong path fails the test):
 
 ```bash
-MPEGTS_FFPROBE=/path/to/ffprobe MPEGTS_FFMPEG=/path/to/ffmpeg cargo test --features mux --test mux
+MPEGTS_FFPROBE=/path/to/ffprobe MPEGTS_FFMPEG=/path/to/ffmpeg cargo test --features mux --test mux --test inject
+MPEGTS_TSDUCK=/directory/with/tsp/and/tsanalyze cargo test --features mux --test inject
 ```
+
+The injector tests run every output through a conformance checker ([tests/harness/check.rs](tests/harness/check.rs)): continuity counters, PSI repetition, the arrival window of every synchronous KLV unit by PCR interpolation, PTS order, PES and cell rules for both carriages, the PMT descriptors, and no PCR on the KLV PID.
 
 ## Fuzzing
 
-Four harnesses in [tests/harness](tests/harness/mod.rs) accept any bytes. They check that nothing panics, results do not depend on how input is split into pushes, every buffer stays within its `Config` limit, and the C API returns only documented status codes:
+Five harnesses in [tests/harness](tests/harness/mod.rs) accept any bytes. They check that nothing panics, results do not depend on how input is split into pushes, every buffer stays within its `Config` limit, and the C API returns only documented status codes:
 
 - `demux`: raw bytes.
 - `stream`: the bytes drive a generator of tables, PES packets, PCRs and corruption, so mutations explore stream structure.
 - `capi`: sequences of C API calls, including invalid arguments and mismatched struct sizes (with `mux`, the write side's calls too).
 - `mux`: random tables, streams, units, sink sizes and counter changes for the write primitives; everything accepted must obey the packet rules and read back unchanged through the demuxer.
+- `inject`: the injector on generated and mutated synthetic streams with random configurations and insert schedules; it must stay within its limits, return only documented errors, and pass every packet it does not own through unchanged and in order.
 
 `cargo test` runs them over a few thousand mutated inputs on the stable toolchain. For longer runs, or coverage-guided fuzzing with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz):
 

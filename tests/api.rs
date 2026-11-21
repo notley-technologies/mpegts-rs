@@ -242,7 +242,7 @@ fn report_display_is_readable() {
 #[test]
 fn serializes_to_json() {
     let r = analyze(&two_programs());
-    let v = serde_json::to_value(&r).unwrap();
+    let v = serde_json::to_value(r).unwrap();
     let s = &v["programs"][0]["streams"];
     assert_eq!(s[0]["codec"], "H264");
     assert_eq!(s[1]["language"], "eng");

@@ -43,8 +43,9 @@
 //! - `mux` adds the `mux` module, the write primitives: TS packets, PAT and PMT,
 //!   PES packets, metadata access unit cells and the MISB ST 1402 KLV
 //!   carriage presets, writing into caller-provided sinks without heap
-//!   allocation. With `capi`, their C functions too. A build without it
-//!   compiles none of that code.
+//!   allocation; and the KLV injector, which inserts KLV into an existing
+//!   stream as it passes through. With `capi`, their C functions too. A
+//!   build without it compiles none of that code.
 //! - `serde` derives `Serialize` for the report types.
 
 #![warn(missing_docs)]

@@ -54,3 +54,11 @@ required-features = ["mux"]
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "inject"
+path = "fuzz_targets/inject.rs"
+required-features = ["mux"]
+test = false
+doc = false
+bench = false
