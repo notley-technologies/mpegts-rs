@@ -5,7 +5,9 @@
 //! transport rate of an interval is its byte count divided by the PCR
 //! difference. [`PcrTimeline`] applies that to whole packets, so a
 //! pass-through tool can tell when each input packet is due, and an
-//! injector can place what it inserts on the same clock.
+//! injector can place what it inserts on the same clock. Live tools that
+//! cannot wait for the closing PCR of an interval extrapolate instead
+//! ([`ClockMode::Extrapolate`]).
 
 use crate::demuxer::PACKET_SIZE;
 use crate::packet::{pcr_delta, PacketHeader, PCR_WRAP};
@@ -22,6 +24,27 @@ pub const DEFAULT_MAX_HELD: usize = 20_000;
 /// is a splice, a loop back to the start of a file or lost input, and the
 /// previous rate is a better guess than spreading the packets over it.
 const MAX_PCR_GAP: i64 = PCR_HZ as i64;
+
+/// How a [`PcrTimeline`] times the packets between two PCRs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum ClockMode {
+    /// Hold the packets of each PCR interval until its closing PCR arrives
+    /// and spread them evenly between the two PCRs: the T-STD's own model
+    /// (ISO/IEC 13818-1 2.4.2.2, R-ISO13818-043). Exact, at the cost of up
+    /// to one PCR interval of latency.
+    #[default]
+    Interpolate,
+    /// Hold nothing: every packet is released as it is pushed, its clock
+    /// extrapolated from the last PCR at the transport rate measured over
+    /// the previous PCR interval (before two PCRs, the initial bitrate given
+    /// to [`PcrTimeline::new`]). Each PCR corrects the clock; within one
+    /// time base it never goes backwards (a packet whose extrapolated clock
+    /// would fall behind an earlier packet's gets that packet's clock),
+    /// while a discontinuity starts the new time base at its PCR. For live
+    /// input, where added latency matters more than exact interpolation.
+    Extrapolate,
+}
 
 /// A packet released by a [`PcrTimeline`], with its times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +66,9 @@ pub struct TimedPacket {
 ///
 /// Packets are held until the next PCR on the PCR PID arrives; the packets
 /// of that interval are then spread evenly between the two PCRs, which is
-/// the T-STD's own model (ISO/IEC 13818-1 2.4.2.2). A PCR gap of a second
+/// the T-STD's own model (ISO/IEC 13818-1 2.4.2.2). With
+/// [`ClockMode::Extrapolate`] nothing is held and each packet's clock is
+/// extrapolated from the last PCR instead. A PCR gap of a second
 /// or more, a backwards step or a discontinuity_indicator (2.4.3.5) keeps
 /// the previous rate instead, so [`TimedPacket::position`] stays continuous
 /// while [`TimedPacket::clock`] follows the stream's own PCR values.
@@ -80,6 +105,15 @@ pub struct PcrTimeline {
     /// (or the initial bitrate).
     rate_ticks: u64,
     rate_packets: u64,
+    mode: ClockMode,
+    /// Extrapolation: the last PCR, the position given to its packet
+    /// before clamping, and the packets since it (that one excluded).
+    anchor: Option<u64>,
+    anchor_position: u64,
+    since: u64,
+    /// Extrapolation: the clock and position of the last released packet.
+    out_clock: Option<u64>,
+    out_position: Option<u64>,
 }
 
 impl PcrTimeline {
@@ -96,7 +130,27 @@ impl PcrTimeline {
             position: 0,
             rate_ticks: (PACKET_SIZE as u64 * 8) * PCR_HZ,
             rate_packets: bitrate.max(1),
+            mode: ClockMode::Interpolate,
+            anchor: None,
+            anchor_position: 0,
+            since: 0,
+            out_clock: None,
+            out_position: None,
         }
+    }
+
+    /// Time packets this way. Default [`ClockMode::Interpolate`]. Set it
+    /// before pushing; packets held when switching to
+    /// [`ClockMode::Extrapolate`] are released at the last known rate with
+    /// the next packet.
+    pub fn with_mode(mut self, mode: ClockMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// How packets are timed.
+    pub fn mode(&self) -> ClockMode {
+        self.mode
     }
 
     /// Hold at most `max_held` packets (at least 1) while waiting for a
@@ -117,17 +171,21 @@ impl PcrTimeline {
         if self.pcr_pid != Some(pid) {
             self.pcr_pid = Some(pid);
             self.last_clock = None;
+            self.anchor = None;
+            self.out_clock = None;
         }
     }
 
-    /// Packets waiting for the next PCR.
+    /// Packets waiting for the next PCR (always 0 with
+    /// [`ClockMode::Extrapolate`]).
     pub fn held(&self) -> usize {
         self.held.len()
     }
 
     /// Add a packet. When it ends a PCR interval (or fills the hold
     /// limit), the waiting packets are passed to `out` in order, with their
-    /// times.
+    /// times. With [`ClockMode::Extrapolate`] the packet is passed to `out`
+    /// at once.
     pub fn push(&mut self, packet: &[u8; PACKET_SIZE], out: &mut impl FnMut(TimedPacket)) {
         // A packet with transport_error_indicator set may have a damaged
         // header (2.4.3.3), so its PCR is not trusted.
@@ -141,10 +199,83 @@ impl PcrTimeline {
             }),
             _ => None,
         };
+        if self.mode == ClockMode::Extrapolate {
+            if !self.held.is_empty() {
+                // Switched from Interpolate with packets waiting.
+                self.release(None, out);
+                self.out_position = Some(self.position);
+                self.anchor = self.last_clock;
+                self.anchor_position = self.position;
+                self.out_clock = self.last_clock;
+                self.since = 0;
+            }
+            let t = self.extrapolated(packet, pcr);
+            out(t);
+            return;
+        }
         self.held.push_back(*packet);
         if pcr.is_some() || self.held.len() >= self.max_held {
             self.release(pcr, out);
         }
+    }
+
+    /// The times of a packet in [`ClockMode::Extrapolate`].
+    fn extrapolated(&mut self, packet: &[u8; PACKET_SIZE], pcr: Option<(u64, bool)>) -> TimedPacket {
+        self.since += 1;
+        // Continuous position: never backwards, starting at 0. Before any
+        // packet was released, last_position + one packet is 0.
+        let next_position = |t: &Self| t.out_position.map_or(0, |p| p.saturating_add(t.extrapolate(1)));
+        let (clock, position) = match pcr {
+            Some((pcr, discontinuity)) => {
+                let pcr = pcr % PCR_WRAP;
+                let trusted = match self.anchor {
+                    Some(last) => {
+                        let d = pcr_delta(pcr, last);
+                        !discontinuity && d > 0 && d < MAX_PCR_GAP
+                    }
+                    None => false,
+                };
+                let (clock, position) = if trusted {
+                    let d = pcr_delta(pcr, self.anchor.unwrap_or(pcr)) as u64;
+                    self.rate_ticks = d;
+                    self.rate_packets = self.since;
+                    // Same time base: the PCR, unless earlier packets were
+                    // already extrapolated past it.
+                    let clock = match self.out_clock {
+                        Some(o) if pcr_delta(pcr, o) < 0 => o,
+                        _ => pcr,
+                    };
+                    (clock, self.anchor_position.saturating_add(d))
+                } else {
+                    // The first PCR, or a new time base (2.4.3.5): the clock
+                    // starts at the PCR, the position continues.
+                    (pcr, next_position(self))
+                };
+                self.anchor = Some(pcr);
+                self.anchor_position = position;
+                self.since = 0;
+                self.started = true;
+                (Some(clock), position)
+            }
+            None => match self.anchor {
+                Some(anchor) => {
+                    let ticks = self.extrapolate(self.since);
+                    let ext = (anchor + ticks % PCR_WRAP) % PCR_WRAP;
+                    let clock = match self.out_clock {
+                        Some(o) if pcr_delta(ext, o) < 0 => o,
+                        _ => ext,
+                    };
+                    (Some(clock), self.anchor_position.saturating_add(ticks))
+                }
+                None => (None, next_position(self)),
+            },
+        };
+        let position = self.out_position.map_or(position, |o| position.max(o));
+        self.out_position = Some(position);
+        self.out_clock = clock;
+        self.position = position;
+        self.last_clock = clock;
+        TimedPacket { packet: *packet, position, clock }
     }
 
     /// Release every waiting packet at the last known rate (end of input,
@@ -311,6 +442,46 @@ mod tests {
         let mut t = PcrTimeline::new(None, 1_504_000).with_max_held(3);
         let out = run(&mut t, &[packet(0x101, None, false); 3]);
         assert_eq!(out, [(27_000, None), (54_000, None), (81_000, None)]);
+    }
+
+    #[test]
+    fn extrapolation_holds_nothing_and_never_goes_back() {
+        // 188 * 8 bits at 1,504,000 bit/s: 27,000 ticks per packet.
+        let mut t = PcrTimeline::new(None, 1_504_000).with_mode(ClockMode::Extrapolate);
+        assert_eq!(t.mode(), ClockMode::Extrapolate);
+        let plain = packet(0x101, None, false);
+        // Before a PCR: no clock, positions at the initial rate.
+        assert_eq!(run(&mut t, &[plain; 2]), [(0, None), (27_000, None)]);
+        // The first PCR sets the clock; the initial rate extrapolates it.
+        let out = run(&mut t, &[packet(0x100, Some(1_000_000), false), plain, plain]);
+        assert_eq!(out, [(54_000, Some(1_000_000)), (81_000, Some(1_027_000)), (108_000, Some(1_054_000))]);
+        assert_eq!(t.held(), 0);
+        // The second PCR measures 90,000 ticks over 3 packets.
+        let out = run(&mut t, &[packet(0x100, Some(1_090_000), false), plain]);
+        assert_eq!(out, [(144_000, Some(1_090_000)), (174_000, Some(1_120_000))]);
+        // The rate drops: the next PCR is behind the extrapolated clock, so
+        // the clock and the position wait for it instead of going back.
+        let out = run(&mut t, &[plain, plain, plain, packet(0x100, Some(1_200_000), false), plain]);
+        assert_eq!(
+            out,
+            [
+                (204_000, Some(1_150_000)),
+                (234_000, Some(1_180_000)),
+                (264_000, Some(1_210_000)),
+                (264_000, Some(1_210_000)),
+                (276_000, Some(1_222_000)),
+            ]
+        );
+        // A discontinuity starts the new time base at its PCR.
+        let out = run(&mut t, &[packet(0x100, Some(5_000), true), plain]);
+        assert_eq!(out, [(298_000, Some(5_000)), (320_000, Some(27_000))]);
+        // Following another PID: no clock until its first PCR.
+        t.set_pcr_pid(0x300);
+        let out = run(&mut t, &[plain, packet(0x300, Some(9_000_000), false)]);
+        assert_eq!(out, [(342_000, None), (364_000, Some(9_000_000))]);
+        let mut flushed = 0;
+        t.flush(&mut |_| flushed += 1);
+        assert_eq!(flushed, 0);
     }
 
     #[test]

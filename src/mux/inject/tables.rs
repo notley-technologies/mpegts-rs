@@ -45,6 +45,7 @@ impl Pids {
 #[derive(Debug, Clone)]
 pub(super) struct Es {
     pub pid: u16,
+    pub stream_type: u8,
     /// The ES_info descriptor loop.
     pub desc: (usize, usize),
     pub codec: Codec,
@@ -113,7 +114,12 @@ impl Pmt {
                 &Descriptors::parse(&raw[desc.0..desc.1]),
                 &prog,
             );
-            streams.push(Es { pid, desc, codec });
+            streams.push(Es {
+                pid,
+                stream_type,
+                desc,
+                codec,
+            });
             at = desc.1;
         }
         Some(Pmt {

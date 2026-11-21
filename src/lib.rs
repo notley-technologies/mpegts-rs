@@ -34,7 +34,10 @@
 //! For working on single packets there are [`PacketHeader`] (the TS header
 //! and adaptation field), [`PesHeader`] (PES header fields and timestamps)
 //! and [`PcrTimeline`] (the program clock time of every packet, interpolated
-//! between PCRs).
+//! between PCRs, or extrapolated for live input). The [`nal`] module reads
+//! H.264, H.265 and MPEG-2 video at the level of NAL units: start codes,
+//! emulation prevention, SEI messages and user data such as MISB ST 0604
+//! timestamps.
 //!
 //! # Features
 //!
@@ -65,6 +68,7 @@ mod crc;
 mod demuxer;
 #[cfg(feature = "mux")]
 pub mod mux;
+pub mod nal;
 mod output;
 mod packet;
 mod psi;
@@ -84,7 +88,7 @@ pub use report::{
     CaSystem, Descriptor, FeedStats, FourCc, Language, PidInfo, Program, Report, Stream, PCR_HZ,
     PTS_HZ,
 };
-pub use timeline::{PcrTimeline, TimedPacket, DEFAULT_MAX_HELD};
+pub use timeline::{ClockMode, PcrTimeline, TimedPacket, DEFAULT_MAX_HELD};
 
 /// Analyse a complete buffer (for example a whole file) in one call.
 pub fn analyze(data: &[u8]) -> Report {

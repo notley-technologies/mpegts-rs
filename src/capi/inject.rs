@@ -6,9 +6,11 @@ use super::*;
 use crate::mux::{
     DropReason, ExistingKlv, Frame, InjectConfig, InjectError, InjectEvent, InjectStats,
     InjectWarning, Injector, InsertUnit, KlvCarriage, OnOverflow, Packet, PacketSink,
-    ProgramSelect, RateMode, SyncKlvOptions, Target, Units,
+    ProgramSelect, RateMode, Record, RecordFormat, SyncKlvOptions, Target, Units, UserDataSkip,
+    VideoSei,
 };
 use crate::packet::NULL_PID;
+use crate::ClockMode;
 use std::os::raw::c_void;
 
 pub const MPEGTS_INJECT_SYNC: u32 = 1;
@@ -22,11 +24,24 @@ pub const MPEGTS_RATE_VBR: u32 = 0;
 pub const MPEGTS_RATE_CBR_FAIL: u32 = 1;
 pub const MPEGTS_RATE_CBR_DROP_OLDEST: u32 = 2;
 
+pub const MPEGTS_VIDEO_SEI_OFF: u32 = 0;
+pub const MPEGTS_VIDEO_SEI_SCAN: u32 = 1;
+pub const MPEGTS_VIDEO_SEI_WRITE: u32 = 2;
+
+pub const MPEGTS_CLOCK_INTERPOLATE: u32 = 0;
+pub const MPEGTS_CLOCK_EXTRAPOLATE: u32 = 1;
+
+pub const MPEGTS_RECORD_TS: u32 = 0;
+pub const MPEGTS_RECORD_M2TS: u32 = 1;
+
 pub const MPEGTS_INJECT_HAS_SERVICE_ID: u32 = 0x01;
 pub const MPEGTS_INJECT_HAS_PID: u32 = 0x02;
 pub const MPEGTS_INJECT_NO_FRAME_ALIGN: u32 = 0x04;
 pub const MPEGTS_INJECT_SYNC_REGISTRATION: u32 = 0x08;
-const CONFIG_FLAGS: u32 = 0x0F;
+/// Number metadata cells per stream instead of per access unit (DECISIONS
+/// X-8): [`CellNumbering::PerStream`](crate::mux::CellNumbering::PerStream).
+pub const MPEGTS_INJECT_CELLS_PER_STREAM: u32 = 0x10;
+const CONFIG_FLAGS: u32 = 0x1F;
 
 pub const MPEGTS_INJECT_UNIT_HAS_PTS: u32 = 0x01;
 
@@ -34,6 +49,8 @@ pub const MPEGTS_FRAME_HAS_DTS: u32 = 0x01;
 pub const MPEGTS_FRAME_HAS_CLOCK: u32 = 0x02;
 pub const MPEGTS_FRAME_RANDOM_ACCESS: u32 = 0x04;
 pub const MPEGTS_FRAME_DISCONTINUITY: u32 = 0x08;
+pub const MPEGTS_FRAME_SCANNED: u32 = 0x10;
+pub const MPEGTS_FRAME_PREFIX_COMPLETE: u32 = 0x20;
 
 pub const MPEGTS_TARGET_MERGED: u32 = 0x01;
 pub const MPEGTS_TARGET_HAS_SERVICE_ID: u32 = 0x02;
@@ -56,6 +73,11 @@ pub const MPEGTS_WARN_MULTI_PROGRAM_VBR: u32 = 1;
 pub const MPEGTS_WARN_SERVICE_ID_CHANGED: u32 = 2;
 pub const MPEGTS_WARN_SERVICE_ID_IN_INPUT: u32 = 3;
 pub const MPEGTS_WARN_LATE_UNIT: u32 = 4;
+pub const MPEGTS_WARN_USER_DATA_SKIPPED: u32 = 5;
+
+pub const MPEGTS_SKIP_INCOMPLETE: u32 = 1;
+pub const MPEGTS_SKIP_PES_TOO_LONG: u32 = 2;
+pub const MPEGTS_SKIP_NO_ROOM: u32 = 3;
 
 /// Receives output packets: `len` is a multiple of 188.
 pub type mpegts_packets_fn =
@@ -92,6 +114,10 @@ pub struct mpegts_inject_config {
     pub max_queued_units: u64,
     pub max_queued_bytes: u64,
     pub max_held_packets: u64,
+    pub video_sei: u32,
+    pub clock: u32,
+    pub record: u32,
+    pub video_sei_max_prefix: u32,
 }
 
 #[repr(C)]
@@ -127,6 +153,9 @@ pub struct mpegts_inject_frame {
     pub pts: u64,
     pub dts: u64,
     pub clock: u64,
+    pub video_codec: u32,
+    pub user_data_count: u32,
+    pub prefix_bytes: u64,
 }
 
 #[repr(C)]
@@ -143,6 +172,9 @@ pub struct mpegts_inject_target {
     pub carriage: u8,
     pub stripped_count: u32,
     pub stripped: [u16; 8],
+    pub video_codec: u32,
+    pub video_stream_type: u8,
+    pub reserved3: [u8; 3],
 }
 
 #[repr(C)]
@@ -178,6 +210,13 @@ pub struct mpegts_inject_stats {
     pub free_bitrate: u64,
     pub added_bitrate: i64,
     pub events_dropped: u64,
+    pub frames_scanned: u64,
+    pub user_data_found: u64,
+    pub user_data_inserted: u64,
+    pub user_data_rewritten: u64,
+    pub user_data_skipped: u64,
+    pub video_packets_added: u64,
+    pub video_slots_filled: u64,
 }
 
 #[repr(C)]
@@ -223,6 +262,9 @@ impl mpegts_inject_config {
         if c.sync.sync_registration_descriptor {
             flags |= MPEGTS_INJECT_SYNC_REGISTRATION;
         }
+        if c.sync.cell_numbering == crate::mux::CellNumbering::PerStream {
+            flags |= MPEGTS_INJECT_CELLS_PER_STREAM;
+        }
         mpegts_inject_config {
             struct_size: size_of_u32::<mpegts_inject_config>(),
             flags,
@@ -259,6 +301,20 @@ impl mpegts_inject_config {
             max_queued_units: c.max_queued_units as u64,
             max_queued_bytes: c.max_queued_bytes as u64,
             max_held_packets: c.max_held_packets as u64,
+            video_sei: match c.video_sei {
+                VideoSei::Scan => MPEGTS_VIDEO_SEI_SCAN,
+                VideoSei::Write => MPEGTS_VIDEO_SEI_WRITE,
+                _ => MPEGTS_VIDEO_SEI_OFF,
+            },
+            clock: match c.clock {
+                ClockMode::Extrapolate => MPEGTS_CLOCK_EXTRAPOLATE,
+                _ => MPEGTS_CLOCK_INTERPOLATE,
+            },
+            record: match c.record {
+                RecordFormat::M2ts => MPEGTS_RECORD_M2TS,
+                _ => MPEGTS_RECORD_TS,
+            },
+            video_sei_max_prefix: u32::try_from(c.video_sei_max_prefix).unwrap_or(u32::MAX),
         }
     }
 
@@ -269,6 +325,11 @@ impl mpegts_inject_config {
         let size = |v: u64| usize::try_from(v).map_err(|_| "a limit is too large");
         let sync = SyncKlvOptions {
             sync_registration_descriptor: self.flags & MPEGTS_INJECT_SYNC_REGISTRATION != 0,
+            cell_numbering: if self.flags & MPEGTS_INJECT_CELLS_PER_STREAM != 0 {
+                crate::mux::CellNumbering::PerStream
+            } else {
+                crate::mux::CellNumbering::PerAccessUnit
+            },
             input_leak_rate: self.input_leak_rate,
             buffer_size: self.buffer_size,
             output_leak_rate: self.output_leak_rate,
@@ -313,6 +374,23 @@ impl mpegts_inject_config {
             .with_max_held_packets(size(self.max_held_packets)?)
             .with_sync_options(sync);
         c.fallback_lead_ms = self.fallback_lead_ms;
+        c.video_sei = match self.video_sei {
+            MPEGTS_VIDEO_SEI_OFF => VideoSei::Off,
+            MPEGTS_VIDEO_SEI_SCAN => VideoSei::Scan,
+            MPEGTS_VIDEO_SEI_WRITE => VideoSei::Write,
+            _ => return Err("video_sei must be an MPEGTS_VIDEO_SEI_* value"),
+        };
+        c.clock = match self.clock {
+            MPEGTS_CLOCK_INTERPOLATE => ClockMode::Interpolate,
+            MPEGTS_CLOCK_EXTRAPOLATE => ClockMode::Extrapolate,
+            _ => return Err("clock must be an MPEGTS_CLOCK_* value"),
+        };
+        c.record = match self.record {
+            MPEGTS_RECORD_TS => RecordFormat::Ts,
+            MPEGTS_RECORD_M2TS => RecordFormat::M2ts,
+            _ => return Err("record must be an MPEGTS_RECORD_* value"),
+        };
+        c.video_sei_max_prefix = size(u64::from(self.video_sei_max_prefix))?;
         if self.flags & MPEGTS_INJECT_HAS_SERVICE_ID != 0 {
             c = c.with_service_id(self.service_id);
         }
@@ -328,6 +406,7 @@ fn inject_status(e: &InjectError) -> i32 {
         InjectError::InvalidConfig(_)
         | InjectError::InvalidUnit(_)
         | InjectError::OutOfOrder { .. }
+        | InjectError::UserData(_)
         | InjectError::Usage(_) => MPEGTS_ERR_INVALID,
         InjectError::QueueFull { .. } => MPEGTS_ERR_FULL,
         _ => MPEGTS_ERR_STREAM,
@@ -366,6 +445,13 @@ fn stats_struct(s: &InjectStats) -> mpegts_inject_stats {
         free_bitrate: s.free_bitrate,
         added_bitrate: s.added_bitrate,
         events_dropped: s.events_dropped,
+        frames_scanned: s.frames_scanned,
+        user_data_found: s.user_data_found,
+        user_data_inserted: s.user_data_inserted,
+        user_data_rewritten: s.user_data_rewritten,
+        user_data_skipped: s.user_data_skipped,
+        video_packets_added: s.video_packets_added,
+        video_slots_filled: s.video_slots_filled,
     }
 }
 
@@ -394,6 +480,9 @@ fn target_struct(t: &Target) -> mpegts_inject_target {
         },
         stripped_count: t.stripped.len() as u32,
         stripped,
+        video_codec: t.video_codec.map_or(0, |c| c.codec() as u32),
+        video_stream_type: t.video_stream_type.unwrap_or(0),
+        reserved3: [0; 3],
     }
 }
 
@@ -454,6 +543,16 @@ fn event_struct(e: &InjectEvent) -> mpegts_inject_event {
                     ev.flags = MPEGTS_EVENT_HAS_PTS;
                     ev.value = pts;
                 }
+                InjectWarning::UserDataSkipped { pts, reason } => {
+                    ev.code = MPEGTS_WARN_USER_DATA_SKIPPED;
+                    ev.flags = MPEGTS_EVENT_HAS_PTS;
+                    ev.value = pts;
+                    ev.bytes = u64::from(match reason {
+                        UserDataSkip::Incomplete => MPEGTS_SKIP_INCOMPLETE,
+                        UserDataSkip::PesTooLong => MPEGTS_SKIP_PES_TOO_LONG,
+                        _ => MPEGTS_SKIP_NO_ROOM,
+                    });
+                }
             }
         }
     }
@@ -484,6 +583,13 @@ impl CallbackSink<'_> {
 impl PacketSink for CallbackSink<'_> {
     fn packet(&mut self, packet: &Packet) {
         self.buf.extend_from_slice(packet);
+        if self.buf.len() >= BATCH {
+            self.flush();
+        }
+    }
+
+    fn record(&mut self, record: &Record) {
+        self.buf.extend_from_slice(record);
         if self.buf.len() >= BATCH {
             self.flush();
         }
@@ -531,7 +637,7 @@ fn record(h: &mut mpegts_injector, r: Result<(), InjectError>) -> i32 {
     }
 }
 
-fn frame_struct(f: &Frame) -> mpegts_inject_frame {
+fn frame_struct(f: &Frame, units: &Units<'_>) -> mpegts_inject_frame {
     let mut flags = 0;
     if f.dts.is_some() {
         flags |= MPEGTS_FRAME_HAS_DTS;
@@ -545,6 +651,13 @@ fn frame_struct(f: &Frame) -> mpegts_inject_frame {
     if f.discontinuity {
         flags |= MPEGTS_FRAME_DISCONTINUITY;
     }
+    let prefix = units.video_prefix();
+    if let Some(p) = prefix {
+        flags |= MPEGTS_FRAME_SCANNED;
+        if p.complete {
+            flags |= MPEGTS_FRAME_PREFIX_COMPLETE;
+        }
+    }
     mpegts_inject_frame {
         struct_size: size_of_u32::<mpegts_inject_frame>(),
         flags,
@@ -554,6 +667,9 @@ fn frame_struct(f: &Frame) -> mpegts_inject_frame {
         pts: f.pts,
         dts: f.dts.unwrap_or(0),
         clock: f.clock.unwrap_or(0),
+        video_codec: prefix.map_or(0, |p| p.codec.codec() as u32),
+        user_data_count: units.user_data().len() as u32,
+        prefix_bytes: prefix.map_or(0, |p| p.bytes as u64),
     }
 }
 
@@ -593,7 +709,7 @@ unsafe fn push_with(
         let mut out = std::mem::take(&mut h.out);
         let mut cb = |frame: &Frame, units: &mut Units<'_>| {
             if let Some(on_frame) = on_frame {
-                let c = frame_struct(frame);
+                let c = frame_struct(frame, units);
                 let mut handle = mpegts_inject_units {
                     units: units as *mut Units<'_> as *mut c_void,
                 };
@@ -763,6 +879,31 @@ pub unsafe extern "C" fn mpegts_injector_push_packet(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn mpegts_injector_push_record(
+    injector: *mut mpegts_injector,
+    record: *const u8,
+    clock: *const u64,
+    sink: mpegts_packets_fn,
+    sink_user: *mut c_void,
+    on_frame: mpegts_frame_fn,
+    frame_user: *mut c_void,
+) -> mpegts_status {
+    if record.is_null() {
+        return MPEGTS_ERR_NULL;
+    }
+    let r: &Record = &*(record as *const Record);
+    let clock = clock.as_ref().copied();
+    push_with(
+        injector,
+        sink,
+        sink_user,
+        on_frame,
+        frame_user,
+        |inj, s, cb| inj.push_record_with(r, clock, s, cb),
+    )
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn mpegts_injector_insert(
     injector: *mut mpegts_injector,
     unit: *const mpegts_inject_unit,
@@ -834,6 +975,71 @@ pub unsafe extern "C" fn mpegts_inject_units_target(
     match u.target() {
         Some(t) => write_out(target, target_struct(t)),
         None => MPEGTS_EMPTY,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mpegts_inject_units_user_data(
+    units: *const mpegts_inject_units,
+    index: u32,
+    uuid: *mut u8,
+    data: *mut *const u8,
+    len: *mut u64,
+) -> mpegts_status {
+    let Some(h) = units.as_ref() else {
+        return MPEGTS_ERR_NULL;
+    };
+    let Some(u) = (h.units as *const Units<'_>).as_ref() else {
+        return MPEGTS_ERR_NULL;
+    };
+    if uuid.is_null() || data.is_null() || len.is_null() {
+        return MPEGTS_ERR_NULL;
+    }
+    let all = u.user_data();
+    let m = &all[check!(super::index(index, all.len()))];
+    ptr::copy_nonoverlapping(m.uuid.as_ptr(), uuid, 16);
+    data.write(if m.payload.is_empty() { ptr::null() } else { m.payload.as_ptr() });
+    len.write(m.payload.len() as u64);
+    MPEGTS_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mpegts_inject_units_write_user_data(
+    units: *mut mpegts_inject_units,
+    uuid: *const u8,
+    data: *const u8,
+    len: usize,
+    replace: *const u8,
+    replace_count: usize,
+) -> mpegts_status {
+    let Some(h) = units.as_mut() else {
+        return MPEGTS_ERR_NULL;
+    };
+    let Some(u) = (h.units as *mut Units<'_>).as_mut() else {
+        return MPEGTS_ERR_NULL;
+    };
+    if uuid.is_null() {
+        return MPEGTS_ERR_NULL;
+    }
+    let mut id = [0u8; 16];
+    ptr::copy_nonoverlapping(uuid, id.as_mut_ptr(), 16);
+    let payload = check!(input(data, len));
+    let Some(bytes) = replace_count.checked_mul(16) else {
+        return MPEGTS_ERR_INVALID;
+    };
+    let raw = check!(input(replace, bytes));
+    let list: Vec<[u8; 16]> = raw
+        .chunks_exact(16)
+        .map(|c| {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(c);
+            a
+        })
+        .collect();
+    // Runs inside the injector's own guarded call.
+    match u.write_user_data(id, payload, &list) {
+        Ok(()) => MPEGTS_OK,
+        Err(e) => inject_status(&e),
     }
 }
 
@@ -935,6 +1141,15 @@ pub unsafe extern "C" fn mpegts_injector_pop_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bytes of mpegts_inject_config before `video_sei`: its size in the
+    /// first header.
+    fn offset_of_video_sei() -> u32 {
+        let v = mem::MaybeUninit::<mpegts_inject_config>::uninit();
+        let base = v.as_ptr();
+        // SAFETY: only the address is taken, nothing is read.
+        (unsafe { ptr::addr_of!((*base).video_sei) } as usize - base as usize) as u32
+    }
 
     fn sized<T: Default>() -> T {
         let mut v = T::default();
@@ -1061,6 +1276,68 @@ mod tests {
 
             let report = crate::analyze(&out);
             assert_eq!(report.stream(0x101).unwrap().codec, crate::Codec::KlvSync);
+        }
+    }
+
+    #[test]
+    fn video_sei_clock_and_record_settings() {
+        unsafe {
+            let mut cfg: mpegts_inject_config = sized();
+            assert_eq!(mpegts_inject_config_default(&mut cfg), MPEGTS_OK);
+            assert_eq!(
+                (cfg.video_sei, cfg.clock, cfg.record, cfg.video_sei_max_prefix),
+                (MPEGTS_VIDEO_SEI_OFF, MPEGTS_CLOCK_INTERPOLATE, MPEGTS_RECORD_TS, 65_536)
+            );
+            cfg.video_sei = MPEGTS_VIDEO_SEI_WRITE;
+            cfg.clock = MPEGTS_CLOCK_EXTRAPOLATE;
+            cfg.record = MPEGTS_RECORD_M2TS;
+            cfg.video_sei_max_prefix = 1000;
+            let c = cfg.to_config().unwrap();
+            assert_eq!(
+                (c.video_sei, c.clock, c.record, c.video_sei_max_prefix),
+                (VideoSei::Write, ClockMode::Extrapolate, RecordFormat::M2ts, 1000)
+            );
+            let back = mpegts_inject_config::from_config(&c);
+            assert_eq!((back.video_sei, back.clock, back.record), (cfg.video_sei, cfg.clock, cfg.record));
+            let mut msg = [0 as c_char; 128];
+            for field in 0..4 {
+                let mut bad = cfg;
+                match field {
+                    0 => bad.video_sei = 3,
+                    1 => bad.clock = 2,
+                    2 => bad.record = 2,
+                    _ => bad.video_sei_max_prefix = 15,
+                }
+                assert_eq!(mpegts_inject_config_check(&bad, msg.as_mut_ptr(), msg.len()), MPEGTS_ERR_INVALID);
+            }
+            // A caller built against the older header: the new fields keep
+            // their defaults.
+            let mut old = cfg;
+            old.struct_size = offset_of_video_sei();
+            let mut inj = ptr::null_mut();
+            assert_eq!(mpegts_injector_new(&old, &mut inj), MPEGTS_OK);
+            let c = (*inj).injector.config();
+            assert_eq!((c.video_sei, c.clock, c.record), (VideoSei::Off, ClockMode::Interpolate, RecordFormat::Ts));
+            // push_record on a 188-byte injector is refused, and the
+            // injector stays usable.
+            let record = [0u8; 192];
+            let mut out: Vec<u8> = Vec::new();
+            let user = &mut out as *mut Vec<u8> as *mut c_void;
+            assert_eq!(
+                mpegts_injector_push_record(inj, record.as_ptr(), ptr::null(), Some(collect), user, None, ptr::null_mut()),
+                MPEGTS_ERR_INVALID
+            );
+            let ts = stream();
+            assert_eq!(
+                mpegts_injector_push(inj, ts.as_ptr(), ts.len(), Some(collect), user, None, ptr::null_mut()),
+                MPEGTS_OK
+            );
+            assert_eq!(mpegts_inject_units_user_data(ptr::null(), 0, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()), MPEGTS_ERR_NULL);
+            assert_eq!(
+                mpegts_inject_units_write_user_data(ptr::null_mut(), ptr::null(), ptr::null(), 0, ptr::null(), 0),
+                MPEGTS_ERR_NULL
+            );
+            mpegts_injector_free(inj);
         }
     }
 

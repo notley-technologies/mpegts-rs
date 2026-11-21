@@ -4,13 +4,14 @@
 //! unchanged and in order.
 
 use super::common::Rng;
+use super::es::{EsConfig, Video};
 use super::synth::{Prog, Synth};
 use super::{generate, Input};
 use mpegts::mux::{
     ExistingKlv, Frame, InjectConfig, InjectError, InjectEvent, Injector, InsertUnit, KlvCarriage,
-    OnOverflow, ProgramSelect, RateMode, Target, Units,
+    OnOverflow, ProgramSelect, RateMode, Record, RecordFormat, Target, Units, VideoSei,
 };
-use mpegts::PcrTimeline;
+use mpegts::{ClockMode, PcrTimeline};
 use std::collections::HashSet;
 
 /// What one run did, so a test can check that random inputs reach the
@@ -94,6 +95,21 @@ fn stream_from(input: &mut Input<'_>) -> Vec<u8> {
         s.pmt_pid_change = Some((u64::from(input.u8()) % s.frames, 0x1100));
     }
     s.first_dts = input.u64() % (1 << 33);
+    if b & 128 != 0 {
+        // Synthetic H.264, H.265 or MPEG-2 video with SEI user data.
+        let e = input.u8();
+        let mut cfg = EsConfig::new([Video::H264, Video::H265, Video::Mpeg2][usize::from(e % 3)]);
+        cfg.other = e & 4 != 0;
+        cfg.misp = e & 8 != 0;
+        cfg.misp_second = e & 16 != 0;
+        cfg.prefix_nal = e & 32 != 0;
+        s.video_unbounded = e & 64 != 0;
+        if e & 128 != 0 {
+            // Last packets without stuffing.
+            s.pes_len = Some(176 + 184 * 3 + 184);
+        }
+        s.es = Some(cfg);
+    }
     let mut ts = s.make().ts;
     // A few byte edits.
     for _ in 0..input.u8() % 4 {
@@ -106,18 +122,52 @@ fn stream_from(input: &mut Input<'_>) -> Vec<u8> {
     ts
 }
 
+/// Video user data, clock and record options, from a byte read after the
+/// stream (so older inputs keep their meaning).
+fn video_options(cfg: &mut InjectConfig, input: &mut Input<'_>) {
+    let v = input.u8();
+    cfg.video_sei = [VideoSei::Off, VideoSei::Scan, VideoSei::Write][usize::from(v % 3)];
+    if v & 4 != 0 {
+        cfg.clock = ClockMode::Extrapolate;
+    }
+    if v & 8 != 0 {
+        cfg.record = RecordFormat::M2ts;
+    }
+    if v & 16 != 0 {
+        cfg.video_sei_max_prefix = 16 + usize::from(input.u8());
+    }
+}
+
+/// The stream as M2TS records with increasing arrival time stamps.
+fn to_m2ts(ts: &[u8], rng: &mut Rng) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ts.len() / 188 * 192);
+    let mut ats = rng.next() as u32;
+    for p in ts.chunks_exact(188) {
+        ats = ats.wrapping_add(1 + rng.below(20_000) as u32);
+        let cpi = (rng.next() as u32) & 0xC000_0000;
+        out.extend_from_slice(&(cpi | (ats & 0x3FFF_FFFF)).to_be_bytes());
+        out.extend_from_slice(p);
+    }
+    out
+}
+
 pub fn inject_run(data: &[u8]) -> InjectRun {
     let mut input = Input::new(data);
     let cfg = config_from(&mut input);
     let by_packet = input.u8() & 1 != 0;
     let seed = input.u64() | 1;
     let ts = stream_from(&mut input);
+    let mut cfg = cfg;
+    video_options(&mut cfg, &mut input);
+    let m2ts = cfg.record == RecordFormat::M2ts;
     let mut run = InjectRun::default();
     let Ok(mut inj) = Injector::new(cfg.clone()) else {
         return run;
     };
 
     let mut rng = Rng(seed);
+    let records = if m2ts { to_m2ts(&ts, &mut rng) } else { Vec::new() };
+    let unit = if m2ts { 192 } else { 188 };
     let mut out = Vec::new();
     let mut targets: Vec<Target> = Vec::new();
     let check_err = |e: &InjectError| {
@@ -156,6 +206,23 @@ pub fn inject_run(data: &[u8]) -> InjectRun {
                 }
             }
             let _ = (u.clock(), u.target(), u.queued());
+            // Video user data: read, and sometimes written.
+            for m in u.user_data() {
+                assert!(m.position.start <= m.position.header && m.position.header <= m.position.end);
+            }
+            if u.video_prefix().is_some() && rng.below(3) != 0 {
+                let uuid = [[0x4D; 16], [0xA8; 16], *b"other-user-data!"][rng.below(3)];
+                let len = match rng.below(16) {
+                    0 => 2000 + rng.below(70_000),
+                    _ => rng.below(64),
+                };
+                let payload: Vec<u8> = (0..len).map(|_| [0, 0, 3, 1, 0xFF][rng.below(5)]).collect();
+                let replace = [[0x4D; 16], *b"MISPmicrosectime"];
+                match u.write_user_data(uuid, &payload, &replace[..rng.below(3)]) {
+                    Ok(()) | Err(InjectError::UserData(_)) => {}
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
         }
     };
     let mut result: Result<(), InjectError> = Ok(());
@@ -166,17 +233,23 @@ pub fn inject_run(data: &[u8]) -> InjectRun {
             timeline.push(p.try_into().unwrap(), &mut |t| timed.push(t));
         }
         timeline.flush(&mut |t| timed.push(t));
-        for t in &timed {
-            result = inj.push_packet_with(&t.packet, t.clock, &mut out, &mut on_frame);
+        for (i, t) in timed.iter().enumerate() {
+            result = if m2ts {
+                let r: &Record = records[i * 192..(i + 1) * 192].try_into().unwrap();
+                inj.push_record_with(r, t.clock, &mut out, &mut on_frame)
+            } else {
+                inj.push_packet_with(&t.packet, t.clock, &mut out, &mut on_frame)
+            };
             if result.is_err() {
                 break;
             }
         }
     } else {
+        let input: &[u8] = if m2ts { &records } else { &ts };
         let mut at = 0;
-        while at < ts.len() {
-            let n = (1 + rng.below(3000)).min(ts.len() - at);
-            result = inj.push_with(&ts[at..at + n], &mut out, &mut on_frame);
+        while at < input.len() {
+            let n = (1 + rng.below(3000)).min(input.len() - at);
+            result = inj.push_with(&input[at..at + n], &mut out, &mut on_frame);
             if result.is_err() {
                 break;
             }
@@ -194,6 +267,7 @@ pub fn inject_run(data: &[u8]) -> InjectRun {
             at += n;
         }
     }
+    let _ = &ts;
     let finished = result.and_then(|()| inj.finish_with(&mut out, &mut on_frame).map(|_| ()));
     if let Err(e) = &finished {
         check_err(e);
@@ -201,12 +275,17 @@ pub fn inject_run(data: &[u8]) -> InjectRun {
         // The error is final.
         assert_eq!(inj.finish(&mut Vec::new()).err().as_ref(), Some(e));
     }
-    assert_eq!(out.len() % 188, 0);
+    assert_eq!(out.len() % unit, 0);
     let stats = inj.stats();
     assert!(stats.units_queued as usize <= cfg.max_queued_units);
     assert!(stats.bytes_queued as usize <= cfg.max_queued_bytes);
     assert!(stats.held_packets as usize <= cfg.max_held_packets + 1);
-    assert_eq!(stats.packets_out as usize, out.len() / 188);
+    assert_eq!(stats.packets_out as usize, out.len() / unit);
+    let out: Vec<u8> = if m2ts {
+        out.chunks_exact(192).flat_map(|r| r[4..].to_vec()).collect()
+    } else {
+        out
+    };
     while let Some(e) = inj.pop_event() {
         if let InjectEvent::TargetFound(t) | InjectEvent::TargetChanged(t) = e {
             targets.push(t);
@@ -229,6 +308,10 @@ pub fn inject_run(data: &[u8]) -> InjectRun {
         skip.insert(t.pmt_pid);
         skip.insert(t.klv_pid);
         skip.extend(&t.stripped);
+        if cfg.video_sei == VideoSei::Write {
+            // Written video changes; its own checks are in tests/video_sei.rs.
+            skip.extend(t.video_pid);
+        }
     }
     let keep = |p: &&[u8]| !skip.contains(&u16::from_be_bytes([p[1] & 0x1F, p[2]]));
     let a: Vec<&[u8]> = ts.chunks_exact(188).filter(keep).collect();
@@ -255,7 +338,7 @@ mod c {
     use std::{mem, ptr, slice};
 
     unsafe extern "C" fn collect(user: *mut c_void, packets: *const u8, len: usize) {
-        assert_eq!(len % 188, 0);
+        assert!(len % 188 == 0 || len % 192 == 0);
         let out = &mut *(user as *mut Vec<u8>);
         out.extend_from_slice(slice::from_raw_parts(packets, len));
     }
@@ -298,6 +381,30 @@ mod c {
             &[MPEGTS_OK, MPEGTS_EMPTY],
             "units_target",
         );
+        // Video user data, read and written.
+        let mut uuid = [0u8; 16];
+        let mut data: *const u8 = ptr::null();
+        let mut len = 0u64;
+        let index = (*n >> 8) % ((*frame).user_data_count + 1);
+        expect(
+            mpegts_inject_units_user_data(units, index, uuid.as_mut_ptr(), &mut data, &mut len),
+            &[MPEGTS_OK, MPEGTS_ERR_RANGE],
+            "units_user_data",
+        );
+        let payload = [0u8, 0, 0, 3, 1];
+        let replace = [0x4Du8; 32];
+        expect(
+            mpegts_inject_units_write_user_data(
+                units,
+                uuid.as_ptr(),
+                payload.as_ptr(),
+                (*n as usize >> 12) % 6,
+                replace.as_ptr(),
+                (*n as usize >> 4) % 3,
+            ),
+            &[MPEGTS_OK, MPEGTS_ERR_INVALID],
+            "units_write_user_data",
+        );
     }
 
     /// Random calls on an injector, with odd configurations and struct
@@ -317,6 +424,12 @@ mod c {
             3 => cfg.carriage = u32::from(ops.u8() % 3),
             4 => cfg.struct_size = struct_size::<mpegts_inject_config>(ops),
             5 => cfg.max_held_packets = u64::from(ops.u16()),
+            6 => {
+                cfg.video_sei = u32::from(ops.u8() % 4);
+                cfg.clock = u32::from(ops.u8() % 3);
+                cfg.video_sei_max_prefix = u32::from(ops.u16());
+            }
+            7 => cfg.record = u32::from(ops.u8() % 3),
             _ => {}
         }
         let mut msg = [0 as c_char; 64];
@@ -347,22 +460,34 @@ mod c {
         let by_packet = ops.bool();
         while at < ts.len() {
             let n = (1 + usize::from(ops.u16() % 2000)).min(ts.len() - at);
-            let status = if by_packet && ts.len() - at >= 188 {
+            let status = if by_packet && ts.len() - at >= 192 {
                 let clock = u64::from(ops.u32()) * 300;
                 let c = if ops.bool() {
                     &clock as *const u64
                 } else {
                     ptr::null()
                 };
-                let s = mpegts_injector_push_packet(
-                    inj,
-                    ts[at..].as_ptr(),
-                    c,
-                    Some(collect),
-                    user,
-                    Some(on_frame),
-                    frame_user,
-                );
+                let s = if cfg.record == MPEGTS_RECORD_M2TS {
+                    mpegts_injector_push_record(
+                        inj,
+                        ts[at..].as_ptr(),
+                        c,
+                        Some(collect),
+                        user,
+                        Some(on_frame),
+                        frame_user,
+                    )
+                } else {
+                    mpegts_injector_push_packet(
+                        inj,
+                        ts[at..].as_ptr(),
+                        c,
+                        Some(collect),
+                        user,
+                        Some(on_frame),
+                        frame_user,
+                    )
+                };
                 at += 188;
                 s
             } else {
@@ -462,7 +587,7 @@ mod c {
             &[MPEGTS_OK, MPEGTS_ERR_INVALID, MPEGTS_ERR_STREAM],
             "finish",
         );
-        assert_eq!(out.len() % 188, 0);
+        assert!(out.len() % 188 == 0 || out.len() % 192 == 0);
         mpegts_injector_free(inj);
     }
 }

@@ -13,7 +13,9 @@
 //! - what the write primitives write (feature `mux`) obeys the packet rules
 //!   and reads back unchanged;
 //! - the injector (feature `mux`) passes every packet it does not own
-//!   through unchanged, within its memory limits.
+//!   through unchanged, within its memory limits;
+//! - the video NAL unit reader (`mpegts::nal`) stays within its input, and
+//!   emulation prevention and SEI rebuilding round-trip.
 #![allow(dead_code)]
 
 #[path = "../common/mod.rs"]
@@ -35,6 +37,7 @@ use std::ptr;
 
 #[cfg(feature = "mux")]
 pub mod check;
+pub mod es;
 #[cfg(feature = "mux")]
 mod inject;
 #[cfg(feature = "mux")]
@@ -53,6 +56,66 @@ pub use mux::{mux, mux_run};
 const MAX_PACKETS: usize = 3000;
 
 // ---------------------------------------------------------------- targets
+
+/// Video elementary stream bytes for `mpegts::nal`: NAL units, user data,
+/// emulation prevention and SEI rebuilding, for every codec.
+pub fn nal(data: &[u8]) {
+    use mpegts::nal::*;
+    let codecs = [VideoCodec::H264, VideoCodec::H265, VideoCodec::Mpeg2];
+    for codec in codecs {
+        let mut found = Vec::new();
+        find_user_data(codec, data, &mut found);
+        for m in &found {
+            let p = m.position;
+            assert!(p.start <= p.header && p.header <= p.end && p.end <= data.len(), "{p:?}");
+            assert!(m.payload.len() + 16 <= data.len());
+        }
+    }
+    let mut prev_end = 0;
+    let mut rebuilt = Vec::new();
+    for u in nal_units(data) {
+        assert!(u.start >= prev_end && u.start <= u.offset && u.end() <= u.next && u.next <= data.len());
+        assert_eq!(&data[u.offset..u.end()], u.data);
+        prev_end = u.end();
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let new = &data[..data.len().min(40)];
+            rebuilt.clear();
+            if replace_sei_payload(codec, u.data, 0, new, &mut rebuilt) {
+                // The replaced message reads back.
+                let mut rbsp = Vec::new();
+                remove_emulation_prevention(&rebuilt[codec.header_len()..], &mut rbsp);
+                let first = sei_messages(&rbsp).next().expect("message 0");
+                assert_eq!(first.payload, new);
+            }
+        }
+    }
+    // Emulation prevention: no start code emulation, and back again.
+    let mut ebsp = Vec::new();
+    add_emulation_prevention(data, &mut ebsp);
+    for w in ebsp.windows(3) {
+        assert!(!(w[0] == 0 && w[1] == 0 && w[2] <= 2), "start code emulation");
+    }
+    for w in ebsp.windows(4) {
+        assert!(w[..3] != [0, 0, 3] || w[3] <= 3);
+    }
+    let mut back = Vec::new();
+    remove_emulation_prevention(&ebsp, &mut back);
+    assert_eq!(back, data);
+    // A user data SEI NAL unit reads back exactly.
+    let (uuid, payload) = data.split_at(data.len().min(16));
+    let mut id = [0u8; 16];
+    id[..uuid.len()].copy_from_slice(uuid);
+    let payload = &payload[..payload.len().min(2000)];
+    for codec in [VideoCodec::H264, VideoCodec::H265] {
+        let mut au = Vec::new();
+        assert!(user_data_sei(codec, 1 + (data.len() % 7) as u8, &id, payload, &mut au));
+        let mut f = Vec::new();
+        find_user_data(codec, &au, &mut f);
+        assert_eq!(f.len(), 1);
+        assert_eq!((f[0].uuid, f[0].payload.as_slice()), (id, payload));
+    }
+    assert!(!user_data_sei(VideoCodec::Mpeg2, 1, &id, payload, &mut Vec::new()));
+}
 
 /// Raw bytes: the first byte picks settings, the rest is the stream.
 pub fn demux(data: &[u8]) {

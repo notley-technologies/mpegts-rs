@@ -37,6 +37,8 @@ fn header_constants_match_rust() {
         ("MPEGTS_CARRIAGE_ASYNC_KLV", MPEGTS_CARRIAGE_ASYNC_KLV),
         ("MPEGTS_SPEC_SYNC_REGISTRATION", MPEGTS_SPEC_SYNC_REGISTRATION),
         ("MPEGTS_PES_HAS_PTS", MPEGTS_PES_HAS_PTS),
+        ("MPEGTS_CELLS_PER_AU", MPEGTS_CELLS_PER_AU),
+        ("MPEGTS_CELLS_PER_STREAM", MPEGTS_CELLS_PER_STREAM),
         ("MPEGTS_PES_HAS_DTS", MPEGTS_PES_HAS_DTS),
         ("MPEGTS_PES_HAS_PCR", MPEGTS_PES_HAS_PCR),
         ("MPEGTS_PES_DATA_ALIGNMENT", MPEGTS_PES_DATA_ALIGNMENT),
@@ -46,11 +48,12 @@ fn header_constants_match_rust() {
     ] {
         assert_eq!(defs.get(name), Some(&i64::from(value)), "{name}");
     }
-    for prefix in ["MPEGTS_CARRIAGE_", "MPEGTS_SPEC_", "MPEGTS_PES_"] {
+    for prefix in ["MPEGTS_CARRIAGE_", "MPEGTS_SPEC_", "MPEGTS_PES_", "MPEGTS_CELLS_"] {
         let n = defs.keys().filter(|k| k.starts_with(prefix)).count();
         let expected = match prefix {
             "MPEGTS_CARRIAGE_" => 3,
             "MPEGTS_SPEC_" => 1,
+            "MPEGTS_CELLS_" => 2,
             _ => 7,
         };
         assert_eq!(n, expected, "{prefix}* constants the Rust side does not know");
@@ -63,6 +66,7 @@ fn header_constants_match_rust() {
         ("MPEGTS_INJECT_HAS_PID", MPEGTS_INJECT_HAS_PID),
         ("MPEGTS_INJECT_NO_FRAME_ALIGN", MPEGTS_INJECT_NO_FRAME_ALIGN),
         ("MPEGTS_INJECT_SYNC_REGISTRATION", MPEGTS_INJECT_SYNC_REGISTRATION),
+        ("MPEGTS_INJECT_CELLS_PER_STREAM", MPEGTS_INJECT_CELLS_PER_STREAM),
         ("MPEGTS_INJECT_UNIT_HAS_PTS", MPEGTS_INJECT_UNIT_HAS_PTS),
         ("MPEGTS_EXISTING_KLV_KEEP", MPEGTS_EXISTING_KLV_KEEP),
         ("MPEGTS_EXISTING_KLV_REPLACE", MPEGTS_EXISTING_KLV_REPLACE),
@@ -91,6 +95,19 @@ fn header_constants_match_rust() {
         ("MPEGTS_WARN_SERVICE_ID_CHANGED", MPEGTS_WARN_SERVICE_ID_CHANGED),
         ("MPEGTS_WARN_SERVICE_ID_IN_INPUT", MPEGTS_WARN_SERVICE_ID_IN_INPUT),
         ("MPEGTS_WARN_LATE_UNIT", MPEGTS_WARN_LATE_UNIT),
+        ("MPEGTS_WARN_USER_DATA_SKIPPED", MPEGTS_WARN_USER_DATA_SKIPPED),
+        ("MPEGTS_SKIP_INCOMPLETE", MPEGTS_SKIP_INCOMPLETE),
+        ("MPEGTS_SKIP_PES_TOO_LONG", MPEGTS_SKIP_PES_TOO_LONG),
+        ("MPEGTS_SKIP_NO_ROOM", MPEGTS_SKIP_NO_ROOM),
+        ("MPEGTS_FRAME_SCANNED", MPEGTS_FRAME_SCANNED),
+        ("MPEGTS_FRAME_PREFIX_COMPLETE", MPEGTS_FRAME_PREFIX_COMPLETE),
+        ("MPEGTS_VIDEO_SEI_OFF", MPEGTS_VIDEO_SEI_OFF),
+        ("MPEGTS_VIDEO_SEI_SCAN", MPEGTS_VIDEO_SEI_SCAN),
+        ("MPEGTS_VIDEO_SEI_WRITE", MPEGTS_VIDEO_SEI_WRITE),
+        ("MPEGTS_CLOCK_INTERPOLATE", MPEGTS_CLOCK_INTERPOLATE),
+        ("MPEGTS_CLOCK_EXTRAPOLATE", MPEGTS_CLOCK_EXTRAPOLATE),
+        ("MPEGTS_RECORD_TS", MPEGTS_RECORD_TS),
+        ("MPEGTS_RECORD_M2TS", MPEGTS_RECORD_M2TS),
     ];
     for (name, value) in inject {
         assert_eq!(defs.get(name), Some(&i64::from(value)), "{name}");
@@ -104,6 +121,10 @@ fn header_constants_match_rust() {
         "MPEGTS_EVENT_",
         "MPEGTS_DROP_",
         "MPEGTS_WARN_",
+        "MPEGTS_SKIP_",
+        "MPEGTS_VIDEO_SEI_",
+        "MPEGTS_CLOCK_",
+        "MPEGTS_RECORD_",
     ] {
         let in_header = defs.keys().filter(|k| k.starts_with(prefix)).count();
         let in_rust = inject.iter().filter(|(k, _)| k.starts_with(prefix)).count();
@@ -180,6 +201,10 @@ fn inject_layout() -> Vec<(String, usize)> {
         field!(mpegts_inject_config, max_queued_units),
         field!(mpegts_inject_config, max_queued_bytes),
         field!(mpegts_inject_config, max_held_packets),
+        field!(mpegts_inject_config, video_sei),
+        field!(mpegts_inject_config, clock),
+        field!(mpegts_inject_config, record),
+        field!(mpegts_inject_config, video_sei_max_prefix),
         field!(mpegts_inject_unit, struct_size),
         field!(mpegts_inject_unit, flags),
         field!(mpegts_inject_unit, pts),
@@ -193,6 +218,9 @@ fn inject_layout() -> Vec<(String, usize)> {
         field!(mpegts_inject_frame, pts),
         field!(mpegts_inject_frame, dts),
         field!(mpegts_inject_frame, clock),
+        field!(mpegts_inject_frame, video_codec),
+        field!(mpegts_inject_frame, user_data_count),
+        field!(mpegts_inject_frame, prefix_bytes),
         field!(mpegts_inject_target, struct_size),
         field!(mpegts_inject_target, flags),
         field!(mpegts_inject_target, program),
@@ -204,6 +232,9 @@ fn inject_layout() -> Vec<(String, usize)> {
         field!(mpegts_inject_target, carriage),
         field!(mpegts_inject_target, stripped_count),
         field!(mpegts_inject_target, stripped),
+        field!(mpegts_inject_target, video_codec),
+        field!(mpegts_inject_target, video_stream_type),
+        field!(mpegts_inject_target, reserved3),
         field!(mpegts_inject_stats, struct_size),
         field!(mpegts_inject_stats, reserved),
         field!(mpegts_inject_stats, packets_in),
@@ -212,6 +243,13 @@ fn inject_layout() -> Vec<(String, usize)> {
         field!(mpegts_inject_stats, metadata_buffer_peak),
         field!(mpegts_inject_stats, added_bitrate),
         field!(mpegts_inject_stats, events_dropped),
+        field!(mpegts_inject_stats, frames_scanned),
+        field!(mpegts_inject_stats, user_data_found),
+        field!(mpegts_inject_stats, user_data_inserted),
+        field!(mpegts_inject_stats, user_data_rewritten),
+        field!(mpegts_inject_stats, user_data_skipped),
+        field!(mpegts_inject_stats, video_packets_added),
+        field!(mpegts_inject_stats, video_slots_filled),
         field!(mpegts_inject_event, struct_size),
         field!(mpegts_inject_event, kind),
         field!(mpegts_inject_event, code),
@@ -313,7 +351,8 @@ fn c_program_writes_a_stream_the_demuxer_reads() {
         "ASYNC_PTS -2".into(),
         "SYNC_NO_PTS -2".into(),
         "ERR invalid unit: synchronous metadata needs a PTS in every PES packet (R-ST1402TIME-17)".into(),
-        "SEQ 6".into(),
+        "SEQ 0".into(),
+        "SEQ_PER_STREAM 6".into(),
         "FROM_REPORT same".into(),
         "FROM_REPORT_PMT same 59".into(),
         format!("WROTE {}", ts.len()),
@@ -381,6 +420,36 @@ fn c_program_writes_a_stream_the_demuxer_reads() {
     }
 }
 
+/// H.264 access units for the C SEI test: an access unit delimiter, on
+/// even frames an SEI NAL unit with an ST 0604-like message, and a slice
+/// NAL unit (opaque data; the injector reads only up to it).
+fn h264_au(i: u64) -> Vec<u8> {
+    let mut au = vec![0, 0, 0, 1, 0x09, 0x30];
+    if i % 2 == 0 {
+        au.extend_from_slice(&[0, 0, 0, 1, 0x06, 0x05, 28]);
+        au.extend_from_slice(b"MISPmicrosectime");
+        au.extend_from_slice(&[0x9F, 0x01, 0x02, 0xFF, 0x03, 0x04, 0xFF, 0x05, 0x06, 0xFF, 0x07, 0x08, 0x80]);
+    }
+    au.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A]);
+    au.resize(au.len() + 1500, 0x55);
+    au
+}
+
+fn sei_stream() -> Vec<u8> {
+    use mpegts::mux::{PesUnit, PesWriter, ProgramTables, StreamSpec};
+    let mut tables = ProgramTables::new(1);
+    tables.add_program(1, 0x1000, Some(0x100)).unwrap();
+    tables.add_stream(1, 0x100, &StreamSpec::h264()).unwrap();
+    let mut video = PesWriter::new(0x100, &StreamSpec::h264()).unwrap();
+    let mut ts = Vec::new();
+    for i in 0..30u64 {
+        tables.write_all(&mut ts).unwrap();
+        let p = 900_000 + i * 3003;
+        video.write(&PesUnit::new(&h264_au(i)).with_pts(p).with_pcr((p - 36_000) * 300), &mut ts).unwrap();
+    }
+    ts
+}
+
 /// A small input for the C injector test: program 1 with H.264 video on
 /// 0x100 carrying the PCR, PAT and PMT every frame, 30 frames.
 fn video_stream() -> (Vec<u8>, Vec<u64>) {
@@ -399,6 +468,28 @@ fn video_stream() -> (Vec<u8>, Vec<u64>) {
         pts.push(p);
     }
     (ts, pts)
+}
+
+/// Index of the first video packet of a stream.
+fn first_video_index(ts: &[u8]) -> u32 {
+    ts.chunks(188).position(|p| u16::from_be_bytes([p[1] & 0x1F, p[2]]) == 0x100).unwrap() as u32
+}
+
+/// Records the C program's M2TS run writes: the input's, plus the PAT and
+/// PMT copies and none consumed (the default configuration inserts no KLV
+/// without units).
+fn sei_records(input: &[u8]) -> usize {
+    use mpegts::mux::{InjectConfig, Injector, RecordFormat};
+    let mut inj = Injector::new(InjectConfig::default().with_record_format(RecordFormat::M2ts)).unwrap();
+    let mut out = Vec::new();
+    for (i, p) in input.chunks(188).enumerate() {
+        let mut r = [0u8; 192];
+        r[..4].copy_from_slice(&(0x4000_0000u32 | (i as u32 * 1000)).to_be_bytes());
+        r[4..].copy_from_slice(p);
+        inj.push_record(&r, None, &mut out).unwrap();
+    }
+    inj.finish(&mut out).unwrap();
+    out.len() / 192
 }
 
 #[test]
@@ -431,10 +522,15 @@ fn c_program_injects_klv() {
     let (input, frame_pts) = video_stream();
     let in_path = work.join(format!("inject_in_{}.ts", std::process::id()));
     let out_path = work.join(format!("inject_out_{}.ts", std::process::id()));
+    let sei_in = work.join(format!("inject_sei_in_{}.ts", std::process::id()));
+    let sei_out = work.join(format!("inject_sei_out_{}.ts", std::process::id()));
     std::fs::write(&in_path, &input).unwrap();
-    let run = Command::new(&exe).arg(&in_path).arg(&out_path).output().unwrap();
+    let sei_input = sei_stream();
+    std::fs::write(&sei_in, &sei_input).unwrap();
+    let run = Command::new(&exe).arg(&in_path).arg(&out_path).arg(&sei_in).arg(&sei_out).output().unwrap();
     let _ = std::fs::remove_file(&exe);
     let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&sei_in);
     let stdout = String::from_utf8(run.stdout).unwrap();
     assert!(run.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&run.stderr));
     let ts = std::fs::read(&out_path).unwrap();
@@ -473,9 +569,36 @@ fn c_program_injects_klv() {
         "CLOCK set".into(),
         "AFTER_FINISH -2".into(),
         "STATUS queue full; try again later / the input cannot be processed as configured".into(),
+        "SEI_DEFAULTS video_sei=0 clock=0 record=0 prefix=65536".into(),
+        "RECORD_WRONG -2".into(),
+        // 15 access units carry the message: rewritten; 15 get one.
+        "SEI frames=30 scanned=30 complete=30 h264=30 messages=15 misp=15 written=30 second=30 range=30".into(),
+        "SEI_STATS scanned=30 found=15 inserted=15 rewritten=15 skipped=0".into(),
+        "SEI_TARGET codec=0x104 stream_type=0x1b".into(),
+        "PACKET_WRONG -2".into(),
+        format!("M2TS first_video_header={:08x}", 0x4000_0000u32 | (first_video_index(&sei_input) * 1000)),
+        format!("M2TS records={} in={} out={}", sei_records(&sei_input), sei_input.len() / 188, sei_records(&sei_input)),
         "DONE".into(),
     ];
     assert_eq!(lines, expected);
+
+    // Every access unit of the SEI output carries the message written.
+    let written = std::fs::read(&sei_out).unwrap();
+    let _ = std::fs::remove_file(&sei_out);
+    let mut d = Demuxer::new();
+    let video = d.subscribe(Subscription::new(Select::Pid(0x100), Unit::Pes)).unwrap();
+    d.push(&written);
+    d.finish();
+    assert!(d.report().pids.iter().all(|p| p.cc_errors == 0));
+    let aus: Vec<_> = d.outputs().filter(|o| o.subscription == video).collect();
+    assert_eq!(aus.len(), 30);
+    for (i, o) in aus.iter().enumerate() {
+        let mut found = Vec::new();
+        mpegts::nal::find_user_data(mpegts::nal::VideoCodec::H264, o.payload(), &mut found);
+        assert_eq!(found.len(), 1, "access unit {i}");
+        assert_eq!(&found[0].uuid, b"MISPmicrosectime");
+        assert_eq!(found[0].payload, [0x9F, 0, 0, 0xFF, 0, 0, 0xFF, 0, 0, 0xFF, 0, i as u8 + 1]);
+    }
 
     // The output reads back: one KLV unit per frame, with its PTS.
     let mut d = Demuxer::new();

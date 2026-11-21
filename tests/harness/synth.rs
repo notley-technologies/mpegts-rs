@@ -6,6 +6,7 @@
 //! every PCR equals the arrival time of its packet.
 
 use super::common::*;
+use super::es::{access_unit, EsConfig};
 
 pub const FRAME_TICKS: u64 = 3003;
 pub const PTS_WRAP: u64 = 1 << 33;
@@ -77,6 +78,13 @@ pub struct Synth {
     /// The video access unit of each frame; by default an access unit
     /// delimiter and filler to `video_bytes`.
     pub video: Option<fn(u64) -> Vec<u8>>,
+    /// Synthetic H.264, H.265 or MPEG-2 video instead (tests/harness/es.rs);
+    /// the PMT gets its stream_type.
+    pub es: Option<EsConfig>,
+    /// With `es`: each video PES this many bytes long (header included).
+    pub pes_len: Option<usize>,
+    /// Video PES with PES_packet_length 0.
+    pub video_unbounded: bool,
 }
 
 impl Default for Synth {
@@ -96,6 +104,9 @@ impl Default for Synth {
             scrambled: false,
             pcr_separate: false,
             video: None,
+            es: None,
+            pes_len: None,
+            video_unbounded: false,
         }
     }
 }
@@ -198,7 +209,8 @@ impl Synth {
                     .collect();
                 ts.section(0, &pat(1, pat_version, &entries));
                 for (p, &pid) in self.programs.iter().zip(&pmt_pids) {
-                    let mut streams = vec![(H264, p.video_pid, vec![])];
+                    let video_type = self.es.map_or(H264, |e| e.video.stream_type());
+                    let mut streams = vec![(video_type, p.video_pid, vec![])];
                     for e in &p.existing {
                         streams.push(match *e {
                             Existing::SyncKlv { pid, service } => {
@@ -230,9 +242,18 @@ impl Synth {
                 } else {
                     dts
                 };
-                let es = match self.video {
-                    Some(f) => f(n),
-                    None => {
+                let video_pts_dts = if self.b_frames && pts != dts {
+                    (Some(pts), Some(dts))
+                } else {
+                    (Some(pts), None)
+                };
+                let header_len = if video_pts_dts.1.is_some() { 19 } else { 14 };
+                let es = match (self.es, self.video) {
+                    (Some(cfg), _) => {
+                        access_unit(&cfg, n, self.b_frames, self.pes_len.map(|l| l.saturating_sub(header_len)))
+                    }
+                    (None, Some(f)) => f(n),
+                    (None, None) => {
                         let mut es = vec![0, 0, 0, 1, 0x09, 0xF0];
                         es.resize(self.video_bytes, 0xA0 ^ n as u8);
                         es
@@ -266,21 +287,16 @@ impl Synth {
                     scrambling: if self.scrambled && pi == 0 { 2 } else { 0 },
                     ..Opts::default()
                 };
-                let video_pts_dts = if self.b_frames && pts != dts {
-                    (Some(pts), Some(dts))
-                } else {
-                    (Some(pts), None)
-                };
                 if pi == 0 {
                     made.frames
                         .push((pts, video_pts_dts.1.unwrap_or(pts), (ts.out.len() / 188)));
                 }
-                send_pes(
-                    &mut ts,
-                    p.video_pid,
-                    o,
-                    &pes_bytes(0xE0, video_pts_dts.0, video_pts_dts.1, &es),
-                );
+                let mut video_pes = pes_bytes(0xE0, video_pts_dts.0, video_pts_dts.1, &es);
+                if self.video_unbounded {
+                    video_pes[4] = 0;
+                    video_pes[5] = 0;
+                }
+                send_pes(&mut ts, p.video_pid, o, &video_pes);
                 for (ei, e) in p.existing.iter().enumerate() {
                     let klv_opts = |ts: &Ts, pid: u16| Opts {
                         pcr: (pcr_in_klv && pid == p.pcr_pid).then(|| pcr_now(ts, offset)),

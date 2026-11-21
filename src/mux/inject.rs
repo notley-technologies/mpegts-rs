@@ -19,6 +19,10 @@
 //!   continuity counters and cell sequence numbers (st1402-time.md D-5);
 //!   with [`ExistingKlv::Replace`] the input's KLV is removed.
 //!
+//! - **The video PID**, only with [`VideoSei::Write`] and a write from the
+//!   frame callback: the access unit's SEI user data is inserted or
+//!   rewritten and the PES re-packetized (see [`Units::write_user_data`]).
+//!
 //! Every other packet goes out unchanged, in order. In [`RateMode::Vbr`]
 //! inserted packets are added before the input packet they precede; in
 //! [`RateMode::Cbr`] they replace null packets, so the packet count and the
@@ -30,7 +34,18 @@
 //! [`min_lead_ms`](InjectConfig::min_lead_ms) before it, by default right
 //! before the video frame they describe (D-ISO13818-14, st1402-time.md
 //! D-7). The program clock of every packet comes from the input's PCRs
-//! ([`PcrTimeline`]).
+//! ([`PcrTimeline`]), interpolated (the default) or, for live input that
+//! must not wait, extrapolated ([`InjectConfig::clock`]).
+//!
+//! With [`VideoSei::Scan`] or [`VideoSei::Write`] the frame callback also
+//! sees the user data messages (SEI user_data_unregistered, MPEG-2
+//! user_data) of each access unit, for example MISB ST 0604 timestamps,
+//! and with `Write` it can write one per access unit
+//! ([`Units::write_user_data`]). The injector stays MISB-agnostic: it
+//! reads and writes messages, the caller decides what is in them.
+//!
+//! The input and output can also be 192-byte M2TS records
+//! ([`RecordFormat::M2ts`]).
 //!
 //! ```
 //! use mpegts::mux::{Frame, InjectConfig, Injector, InsertUnit, KlvCarriage, Units};
@@ -54,15 +69,19 @@
 
 mod core;
 mod framer;
+mod m2ts;
 mod plan;
 mod reorder;
 mod tables;
+mod video;
 
 use self::core::{Core, UnitQueue};
 use self::framer::Framer;
 use self::tables::{Applied, Pids, Sections, Tables};
-use super::{MuxError, Packet, PacketSink, SyncKlvOptions};
-use crate::{PcrTimeline, PTS_WRAP};
+use self::video::AuContext;
+use super::{MuxError, Packet, PacketSink, Record, SyncKlvOptions, M2TS_RECORD_SIZE};
+use crate::nal::{UserData, VideoCodec};
+use crate::{ClockMode, PcrTimeline, PACKET_SIZE, PTS_WRAP};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -146,6 +165,62 @@ pub enum RateMode {
     },
 }
 
+/// Whether the injector reads and writes user data in the target's video
+/// (MUXING_PLAN 6.8, st1402-time.md D-12 to D-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum VideoSei {
+    /// Video bytes are never parsed or changed.
+    #[default]
+    Off,
+    /// Read the user data messages in the prefix of every access unit
+    /// (everything before its first VCL NAL unit, or first slice in MPEG-2)
+    /// of H.264, H.265 and MPEG-2 video, for the frame callback
+    /// ([`Units::user_data`]). The output is unchanged; the frame callback
+    /// runs once the prefix has been read, so the packets from the frame's
+    /// first packet up to then are held (usually none: the prefix is in
+    /// the first packet).
+    Scan,
+    /// Scan, and let the frame callback write one user data message per
+    /// access unit ([`Units::write_user_data`]). H.264 (stream_type 0x1B)
+    /// and H.265 (0x24) only: a target program with other video, or none,
+    /// fails with [`InjectError::Unsupported`] when it is chosen. In
+    /// [`RateMode::Cbr`] each video PES is held whole, with the packets
+    /// between, so its free room is known before the callback runs.
+    Write,
+}
+
+/// Packet format of the input and of the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum RecordFormat {
+    /// 188-byte transport stream packets.
+    #[default]
+    Ts,
+    /// 192-byte M2TS records (BDAV MPEG-2 transport stream, IEC 61883-4
+    /// source packets): a 4-byte TP_extra_header (2-bit
+    /// copy_permission_indicator, 30-bit arrival_time_stamp), then the
+    /// packet. Input records keep their header. A packet the injector adds
+    /// gets the copy_permission_indicator of the next input record and an
+    /// arrival_time_stamp interpolated linearly (modulo 2^30) between the
+    /// previous and next input records, evenly spaced; when it replaces an
+    /// input packet (a rewritten PAT or PMT) the last of them lands on that
+    /// record's stamp, and after the last input record the spacing of the
+    /// last two is continued. In [`RateMode::Cbr`] every output record is
+    /// an input record and keeps its header. The output goes to
+    /// [`PacketSink::record`]; byte input is framed at 192 bytes
+    /// ([`Injector::push`]), packet input comes through
+    /// [`Injector::push_record`].
+    M2ts,
+}
+
+/// Default for [`InjectConfig::video_sei_max_prefix`]: 64 KiB.
+pub const DEFAULT_VIDEO_SEI_MAX_PREFIX: usize = 64 << 10;
+
+/// Most payload bytes of one [`Units::write_user_data`]: 65,519 (with the
+/// 16-byte uuid, 65,535).
+pub const MAX_USER_DATA_PAYLOAD: usize = 65_535 - 16;
+
 /// Settings of an [`Injector`]. Start from [`Default`] and change what you
 /// need, directly or with the `with_*` setters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,14 +268,38 @@ pub struct InjectConfig {
     pub max_queued_units: usize,
     /// Most bytes of units waiting to be sent. Default 8 MiB.
     pub max_queued_bytes: usize,
-    /// Most input packets held while waiting for the target program's PMT
-    /// (and, for [`Injector::push`], for the next PCR). Default 50,000
-    /// (about 9.4 MB).
+    /// Most input packets held while waiting for the target program's PMT,
+    /// for [`Injector::push`] for the next PCR, and with
+    /// [`VideoSei::Scan`] or [`VideoSei::Write`] for a video access unit's
+    /// prefix (or, in CBR with `Write`, its whole PES); each of these holds
+    /// is bounded by it. Default 50,000 (about 9.4 MB).
     pub max_held_packets: usize,
     /// metadata_STD_descriptor values and the optional registration
     /// descriptor of a synchronous stream. Its `service_id` is not used;
     /// see [`service_id`](Self::service_id).
     pub sync: SyncKlvOptions,
+    /// Read, or read and write, user data in the target's video. Default
+    /// [`VideoSei::Off`].
+    pub video_sei: VideoSei,
+    /// With [`VideoSei::Scan`] or [`VideoSei::Write`], most elementary
+    /// stream bytes of an access unit read while looking for its first VCL
+    /// NAL unit. Past it the frame callback runs with what was found and
+    /// writes are refused and counted. Default
+    /// [`DEFAULT_VIDEO_SEI_MAX_PREFIX`] (64 KiB); at least 16.
+    pub video_sei_max_prefix: usize,
+    /// How [`Injector::push`] times packets: [`ClockMode::Interpolate`]
+    /// (default) holds each PCR interval until its closing PCR;
+    /// [`ClockMode::Extrapolate`] holds nothing, so with [`VideoSei::Off`]
+    /// every packet pushed (once the target is known, and while the input
+    /// stays in sync) is written before `push` returns: the mode for live
+    /// injection. Extrapolation uses the rate of the previous PCR interval
+    /// (10 Mbit/s until two PCRs have been seen), is corrected at each PCR
+    /// and never goes backwards within a time base. Packets pushed with
+    /// their own clock ([`Injector::push_packet`]) are not affected.
+    pub clock: ClockMode,
+    /// 188-byte packets or 192-byte M2TS records, in and out. Default
+    /// [`RecordFormat::Ts`].
+    pub record: RecordFormat,
 }
 
 impl Default for InjectConfig {
@@ -221,6 +320,10 @@ impl Default for InjectConfig {
             max_queued_bytes: 8 << 20,
             max_held_packets: 50_000,
             sync: SyncKlvOptions::default(),
+            video_sei: VideoSei::Off,
+            video_sei_max_prefix: DEFAULT_VIDEO_SEI_MAX_PREFIX,
+            clock: ClockMode::Interpolate,
+            record: RecordFormat::Ts,
         }
     }
 }
@@ -311,6 +414,38 @@ impl InjectConfig {
         self
     }
 
+    /// With this video user data mode.
+    pub fn with_video_sei(mut self, mode: VideoSei) -> Self {
+        self.video_sei = mode;
+        self
+    }
+
+    /// With this limit on the access unit prefix read.
+    pub fn with_video_sei_max_prefix(mut self, bytes: usize) -> Self {
+        self.video_sei_max_prefix = bytes;
+        self
+    }
+
+    /// With this clock for [`Injector::push`].
+    pub fn with_clock(mut self, clock: ClockMode) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// With this packet format.
+    pub fn with_record_format(mut self, record: RecordFormat) -> Self {
+        self.record = record;
+        self
+    }
+
+    /// Bytes per input and output unit: 188 or 192.
+    fn stride(&self) -> usize {
+        match self.record {
+            RecordFormat::M2ts => M2TS_RECORD_SIZE,
+            _ => PACKET_SIZE,
+        }
+    }
+
     fn validate(&self) -> Result<(), InjectError> {
         let bad = |why| Err(InjectError::InvalidConfig(why));
         if !(1..250).contains(&self.psi_interval_ms) {
@@ -327,6 +462,9 @@ impl InjectConfig {
         }
         if self.max_queued_units == 0 || self.max_queued_bytes == 0 || self.max_held_packets == 0 {
             return bad("queue and hold limits must be at least 1");
+        }
+        if self.video_sei_max_prefix < 16 {
+            return bad("video_sei_max_prefix must be at least 16");
         }
         if let Some(pid) = self.pid {
             if !(0x0010..crate::NULL_PID).contains(&pid) {
@@ -428,12 +566,31 @@ impl InsertUnit {
 
 /// Inserts units from inside a frame callback (see [`Injector::push_with`]).
 /// Units inserted here go out before the frame's first packet when their
-/// window allows.
+/// window allows. With [`VideoSei::Scan`] or [`VideoSei::Write`] it also
+/// gives the access unit's user data and, with `Write`, writes it.
 #[derive(Debug)]
 pub struct Units<'a> {
     queue: &'a mut UnitQueue,
     clock: Option<u64>,
     target: Option<&'a Target>,
+    au: Option<&'a mut AuContext>,
+}
+
+/// What was read of an access unit's prefix (see [`Units::video_prefix`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VideoPrefix {
+    /// The video format.
+    pub codec: VideoCodec,
+    /// The prefix was read up to the first VCL NAL unit (first slice in
+    /// MPEG-2), so a write can be placed. False when the PES did not start
+    /// with a start code (nothing is reported then), ended first, or
+    /// [`InjectConfig::video_sei_max_prefix`] or
+    /// [`InjectConfig::max_held_packets`] was reached first.
+    pub complete: bool,
+    /// Elementary stream bytes of the prefix read: up to the first VCL NAL
+    /// unit's start code when complete.
+    pub bytes: usize,
 }
 
 impl Units<'_> {
@@ -462,6 +619,95 @@ impl Units<'_> {
     pub fn queued(&self) -> usize {
         self.queue.len()
     }
+
+    /// With [`VideoSei::Scan`] or [`VideoSei::Write`], what was read of
+    /// this access unit; `None` when nothing was (video sei off, a video
+    /// format the injector does not read).
+    pub fn video_prefix(&self) -> Option<VideoPrefix> {
+        self.au.as_ref().map(|a| a.prefix())
+    }
+
+    /// The user data messages in this access unit's prefix, in stream
+    /// order: SEI user_data_unregistered messages (H.264, H.265) and MPEG-2
+    /// user_data, each with its 16-byte identifier and payload (emulation
+    /// prevention removed). Positions are offsets in the PES payload (the
+    /// elementary stream bytes of the frame's PES packet, from its first
+    /// byte after the PES header). Empty without [`VideoSei::Scan`] or
+    /// [`VideoSei::Write`]. At most 64 messages are reported.
+    pub fn user_data(&self) -> &[UserData] {
+        self.au.as_ref().map_or(&[], |a| a.user_data.as_slice())
+    }
+
+    /// Write one user_data_unregistered message into this access unit
+    /// ([`VideoSei::Write`], H.264 or H.265):
+    ///
+    /// - **Rewrite**: when a message of [`user_data`](Self::user_data) has
+    ///   its identifier in `replace` or equal to `uuid` (the first such
+    ///   message), it becomes `uuid` + `payload` in place: same SEI NAL
+    ///   unit, same position, the other messages of that NAL unit
+    ///   unchanged, payloadSize coded again and emulation prevention run
+    ///   again on the NAL unit (st1402-time.md D-12, R-ST1402TIME-81). Pass
+    ///   the message's own identifier as `uuid` to keep it, as D-12 does.
+    ///   A NAL unit that gets shorter is followed by zero bytes
+    ///   (trailing_zero_8bits, ITU-T H.264 B.1, H.265 B.2), so the PES
+    ///   keeps its size.
+    /// - **Insert**: otherwise a new SEI NAL unit holding only this
+    ///   message, with a 4-byte start code, goes immediately before the
+    ///   first VCL NAL unit, after the access unit delimiter, parameter
+    ///   sets and every existing SEI NAL unit (R-ST1402TIME-82, -83, -86,
+    ///   -87). H.264: header 0x06 (nal_ref_idc 0, R-ST1402TIME-79), before
+    ///   a prefix NAL unit (type 14) that directly precedes the first VCL
+    ///   NAL unit. H.265: PREFIX_SEI_NUT, nuh_layer_id 0,
+    ///   nuh_temporal_id_plus1 of the first VCL NAL unit (R-ST1402TIME-84,
+    ///   -85).
+    ///
+    /// The PES is then re-packetized: the bytes go into the adaptation
+    /// field stuffing of the PES's packets, the PES_packet_length is
+    /// rewritten when it is not 0, PTS and DTS never change
+    /// (R-ST1402TIME-09, -14), the video PID's continuity counters are
+    /// renumbered, and every PCR stays on its packet (R-ST1402TIME-11). In
+    /// [`RateMode::Vbr`] what stuffing cannot absorb goes into added video
+    /// packets at the end of the PES; in [`RateMode::Cbr`] into null
+    /// packets of the held PES, keeping the packet count. The write is
+    /// applied when the callback returns; when it cannot be (no room in
+    /// CBR with [`OnOverflow::DropOldest`], a PES_packet_length over 65535)
+    /// the access unit goes out unchanged and
+    /// [`InjectStats::user_data_skipped`] and an
+    /// [`InjectWarning::UserDataSkipped`] event report it. With
+    /// [`OnOverflow::Fail`] a lack of room is [`InjectError::CbrOverflow`].
+    ///
+    /// Refused with [`InjectError::UserData`]: without
+    /// [`VideoSei::Write`], for video the injector does not write, for a
+    /// second write in one access unit, a payload over
+    /// [`MAX_USER_DATA_PAYLOAD`], and when the prefix was not read
+    /// completely ([`VideoPrefix::complete`]; this one is also counted as
+    /// skipped).
+    ///
+    /// ```
+    /// use mpegts::mux::{Frame, InjectConfig, Injector, Units, VideoSei};
+    ///
+    /// // The MISB ST 0604 identifier for H.264 (st1402-time.md 3.8).
+    /// const MISP: [u8; 16] = *b"MISPmicrosectime";
+    /// let mut injector = Injector::new(InjectConfig::default().with_video_sei(VideoSei::Write))?;
+    /// let mut on_frame = |_: &Frame, units: &mut Units<'_>| {
+    ///     // Time Status and the modified time stamp; rewrites the access
+    ///     // unit's own ST 0604 message when it has one.
+    ///     let payload = [0x9F, 0x00, 0x05, 0xFF, 0xE3, 0x97, 0xFF, 0xF8, 0x7C, 0xFF, 0x11, 0x6A];
+    ///     let _ = units.write_user_data(MISP, &payload, &[MISP]);
+    /// };
+    /// # let input: Vec<u8> = Vec::new();
+    /// let mut out = Vec::new();
+    /// injector.push_with(&input, &mut out, &mut on_frame)?;
+    /// # Ok::<(), mpegts::mux::InjectError>(())
+    /// ```
+    pub fn write_user_data(&mut self, uuid: [u8; 16], payload: &[u8], replace: &[[u8; 16]]) -> Result<(), InjectError> {
+        match &mut self.au {
+            Some(au) => au.request_write(uuid, payload, replace),
+            None => Err(InjectError::UserData(
+                "no access unit prefix was read: needs VideoSei::Write and H.264 or H.265 video",
+            )),
+        }
+    }
 }
 
 /// The program the injector writes into, and how.
@@ -476,6 +722,11 @@ pub struct Target {
     pub pcr_pid: Option<u16>,
     /// Its first video PID, the one frames are taken from.
     pub video_pid: Option<u16>,
+    /// stream_type of that video stream.
+    pub video_stream_type: Option<u8>,
+    /// Its format, when it is one whose user data the injector reads
+    /// ([`VideoSei`]).
+    pub video_codec: Option<VideoCodec>,
     /// PID of the KLV stream written.
     pub klv_pid: u16,
     /// metadata_service_id of the service written (synchronous only).
@@ -553,6 +804,24 @@ pub struct InjectStats {
     pub added_bitrate: i64,
     /// Events dropped because nobody popped them.
     pub events_dropped: u64,
+    /// Video access units whose prefix was read ([`VideoSei::Scan`],
+    /// [`VideoSei::Write`]).
+    pub frames_scanned: u64,
+    /// User data messages found in those prefixes.
+    pub user_data_found: u64,
+    /// SEI NAL units inserted ([`Units::write_user_data`]).
+    pub user_data_inserted: u64,
+    /// User data messages rewritten in place.
+    pub user_data_rewritten: u64,
+    /// Writes not applied because of the stream: the prefix not read
+    /// completely, a PES_packet_length that would exceed 65535, no room in
+    /// [`RateMode::Cbr`] with [`OnOverflow::DropOldest`].
+    pub user_data_skipped: u64,
+    /// Video packets added to carry written user data ([`RateMode::Vbr`]).
+    pub video_packets_added: u64,
+    /// Null packets that became video packets to carry written user data
+    /// ([`RateMode::Cbr`]).
+    pub video_slots_filled: u64,
 }
 
 /// Why units were dropped.
@@ -567,6 +836,20 @@ pub enum DropReason {
     Discontinuity,
     /// Still queued at the end.
     Unplaced,
+}
+
+/// Why a user data write was not applied (see
+/// [`InjectWarning::UserDataSkipped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum UserDataSkip {
+    /// The access unit's prefix was not read up to its first VCL NAL unit
+    /// ([`VideoPrefix::complete`] is false).
+    Incomplete,
+    /// The PES_packet_length would exceed 65535.
+    PesTooLong,
+    /// Not enough room in [`RateMode::Cbr`] ([`OnOverflow::DropOldest`]).
+    NoRoom,
 }
 
 /// Things worth knowing that are not errors.
@@ -598,6 +881,14 @@ pub enum InjectWarning {
     LateUnit {
         /// Its PTS.
         pts: u64,
+    },
+    /// A user data write of the frame callback was not applied; the access
+    /// unit went out unchanged.
+    UserDataSkipped {
+        /// PTS of the access unit.
+        pts: u64,
+        /// Why.
+        reason: UserDataSkip,
     },
 }
 
@@ -634,9 +925,9 @@ pub enum InjectEvent {
 }
 
 /// Why the injector refused something. Errors from processing input (all
-/// but [`InvalidUnit`](Self::InvalidUnit), [`OutOfOrder`](Self::OutOfOrder)
-/// and [`QueueFull`](Self::QueueFull)) are final: every later call returns
-/// the same error.
+/// but [`InvalidUnit`](Self::InvalidUnit), [`OutOfOrder`](Self::OutOfOrder),
+/// [`QueueFull`](Self::QueueFull) and [`UserData`](Self::UserData)) are
+/// final: every later call returns the same error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InjectError {
@@ -711,6 +1002,8 @@ pub enum InjectError {
     },
     /// An input the injector does not handle.
     Unsupported(&'static str),
+    /// A user data write refused ([`Units::write_user_data`]).
+    UserData(&'static str),
     /// [`Injector::push`] and [`Injector::push_packet`] mixed on one
     /// injector, or a call after [`Injector::finish`].
     Usage(&'static str),
@@ -753,6 +1046,7 @@ impl fmt::Display for InjectError {
                 write!(f, " before its deadline: {free_per_second} free slots per second measured")
             }
             InjectError::Unsupported(why) => write!(f, "unsupported input: {why}"),
+            InjectError::UserData(why) => write!(f, "user data write refused: {why}"),
             InjectError::Usage(why) => f.write_str(why),
             InjectError::Mux(e) => write!(f, "write error: {e}"),
         }
@@ -775,17 +1069,19 @@ impl InjectError {
             InjectError::InvalidUnit(_)
                 | InjectError::OutOfOrder { .. }
                 | InjectError::QueueFull { .. }
+                | InjectError::UserData(_)
         )
     }
 }
 
-/// Input packets waiting for the target program's PMT.
+/// Input packets waiting for the target program's PMT, with their clock
+/// and M2TS TP_extra_header.
 #[derive(Debug, Default)]
 struct Hold {
     tables: Tables,
     observed: Pids,
     sections: Sections,
-    packets: VecDeque<(Packet, Option<u64>)>,
+    packets: VecDeque<(Packet, Option<u64>, [u8; 4])>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -803,6 +1099,8 @@ struct Pipeline {
     /// The program clock for [`Injector::push`]; `None` while the target
     /// has no PCR.
     timeline: Option<PcrTimeline>,
+    /// M2TS TP_extra_headers of the packets the timeline holds, in order.
+    recs: VecDeque<[u8; 4]>,
     core: Core,
 }
 
@@ -810,12 +1108,15 @@ struct Pipeline {
 ///
 /// Push the input as bytes ([`push`](Self::push), any chunking; packets are
 /// timed on the program clock by an internal [`PcrTimeline`], which holds
-/// each PCR interval until its closing PCR arrives) or as packets with
-/// their clock ([`push_packet`](Self::push_packet), for callers that time
-/// the input themselves, for example to pace output). Use one style per
-/// injector. Units go in with [`insert`](Self::insert), or from the frame
-/// callback of the `_with` variants, which runs right before each video
-/// frame of the target is written.
+/// each PCR interval until its closing PCR arrives, or with
+/// [`ClockMode::Extrapolate`] holds nothing) or as packets with their clock
+/// ([`push_packet`](Self::push_packet), or [`push_record`](Self::push_record)
+/// for M2TS, for callers that time the input themselves, for example to
+/// pace output). Use one style per injector. Units go in with
+/// [`insert`](Self::insert), or from the frame callback of the `_with`
+/// variants, which runs right before each video frame of the target is
+/// written (with [`VideoSei::Scan`] or [`VideoSei::Write`], once the
+/// frame's access unit prefix has been read).
 ///
 /// Until the target program's PMT is known, input is held (at most
 /// [`InjectConfig::max_held_packets`] packets), so every decision applies
@@ -836,11 +1137,12 @@ impl Injector {
     pub fn new(cfg: InjectConfig) -> Result<Self, InjectError> {
         cfg.validate()?;
         Ok(Injector {
-            framer: Framer::default(),
+            framer: Framer::new(cfg.stride()),
             pipe: Pipeline {
                 input: Input::None,
                 hold: Some(Hold::new()),
                 timeline: None,
+                recs: VecDeque::new(),
                 core: Core::new(cfg),
             },
             failed: None,
@@ -887,7 +1189,8 @@ impl Injector {
         r
     }
 
-    /// Push input bytes in any chunking; the output goes to `sink`.
+    /// Push input bytes in any chunking (188-byte packets, or 192-byte
+    /// records with [`RecordFormat::M2ts`]); the output goes to `sink`.
     pub fn push<S: PacketSink + ?Sized>(
         &mut self,
         data: &[u8],
@@ -898,7 +1201,10 @@ impl Injector {
 
     /// [`push`](Self::push), calling `on_frame` right before the first
     /// packet of each video frame of the target is written: units inserted
-    /// through its [`Units`] can go out immediately before that frame.
+    /// through its [`Units`] can go out immediately before that frame. With
+    /// [`VideoSei::Scan`] or [`VideoSei::Write`] it runs once the frame's
+    /// access unit prefix has been read, and its [`Units`] gives the user
+    /// data found there and takes a write.
     pub fn push_with<S, F>(
         &mut self,
         data: &[u8],
@@ -912,14 +1218,17 @@ impl Injector {
         self.usable(Some(Input::Bytes))?;
         let mut result = Ok(());
         let pipe = &mut self.pipe;
-        self.framer
-            .push(data, &mut |p| match pipe.bytes_packet(p, sink, on_frame) {
+        let m2ts = pipe.core.cfg.record == RecordFormat::M2ts;
+        self.framer.push(data, &mut |unit| {
+            let (rec, p) = if m2ts { split_unit(unit) } else { ([0; 4], as_packet(unit)) };
+            match pipe.bytes_packet(rec, p, sink, on_frame) {
                 Ok(()) => true,
                 Err(e) => {
                     result = Err(e);
                     false
                 }
-            });
+            }
+        });
         self.pipe.core.stats.bytes_skipped = self.framer.bytes_skipped;
         self.pipe.core.stats.sync_losses = self.framer.sync_losses;
         self.outcome(result)
@@ -927,7 +1236,8 @@ impl Injector {
 
     /// Push one packet with its program clock (27 MHz, as
     /// [`TimedPacket::clock`](crate::TimedPacket::clock) gives it). No
-    /// clock is held back: the caller's clock is used as is.
+    /// clock is held back: the caller's clock is used as is. With
+    /// [`RecordFormat::M2ts`], use [`push_record`](Self::push_record).
     pub fn push_packet<S: PacketSink + ?Sized>(
         &mut self,
         packet: &Packet,
@@ -950,8 +1260,49 @@ impl Injector {
         S: PacketSink + ?Sized,
         F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
     {
+        if self.pipe.core.cfg.record != RecordFormat::Ts {
+            self.usable(None)?;
+            return Err(InjectError::Usage(
+                "push_packet takes 188-byte packets; with RecordFormat::M2ts use push_record",
+            ));
+        }
         self.usable(Some(Input::Packets))?;
-        let r = self.pipe.timed_packet(packet, clock, sink, on_frame);
+        let r = self.pipe.timed_packet(packet, clock, [0; 4], sink, on_frame);
+        self.outcome(r)
+    }
+
+    /// Push one 192-byte M2TS record ([`RecordFormat::M2ts`]) with the
+    /// program clock of its packet, as [`push_packet`](Self::push_packet)
+    /// does for packets. Its TP_extra_header goes out with the packet.
+    pub fn push_record<S: PacketSink + ?Sized>(
+        &mut self,
+        record: &Record,
+        clock: Option<u64>,
+        sink: &mut S,
+    ) -> Result<(), InjectError> {
+        self.push_record_with(record, clock, sink, &mut |_: &Frame, _: &mut Units<'_>| {})
+    }
+
+    /// [`push_record`](Self::push_record) with a frame callback, as in
+    /// [`push_with`](Self::push_with).
+    pub fn push_record_with<S, F>(
+        &mut self,
+        record: &Record,
+        clock: Option<u64>,
+        sink: &mut S,
+        on_frame: &mut F,
+    ) -> Result<(), InjectError>
+    where
+        S: PacketSink + ?Sized,
+        F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
+    {
+        if self.pipe.core.cfg.record != RecordFormat::M2ts {
+            self.usable(None)?;
+            return Err(InjectError::Usage("push_record needs RecordFormat::M2ts"));
+        }
+        self.usable(Some(Input::Packets))?;
+        let (rec, p) = split_unit(record);
+        let r = self.pipe.timed_packet(p, clock, rec, sink, on_frame);
         self.outcome(r)
     }
 
@@ -985,14 +1336,16 @@ impl Injector {
         let mut result = Ok(());
         let pipe = &mut self.pipe;
         if pipe.input == Input::Bytes {
-            self.framer
-                .finish(&mut |p| match pipe.bytes_packet(p, sink, on_frame) {
+            self.framer.finish(&mut |unit| {
+                let (rec, p) = split_unit(unit);
+                match pipe.bytes_packet(rec, p, sink, on_frame) {
                     Ok(()) => true,
                     Err(e) => {
                         result = Err(e);
                         false
                     }
-                });
+                }
+            });
             pipe.core.stats.bytes_skipped = self.framer.bytes_skipped;
             pipe.core.stats.sync_losses = self.framer.sync_losses;
         }
@@ -1048,7 +1401,8 @@ impl Injector {
     pub fn stats(&self) -> InjectStats {
         let mut s = self.pipe.core.snapshot();
         let held = self.pipe.hold.as_ref().map_or(0, |h| h.packets.len())
-            + self.pipe.timeline.as_ref().map_or(0, |t| t.held());
+            + self.pipe.timeline.as_ref().map_or(0, |t| t.held())
+            + self.pipe.core.video_held();
         s.held_packets = held as u64;
         s
     }
@@ -1057,6 +1411,21 @@ impl Injector {
     pub fn pop_event(&mut self) -> Option<InjectEvent> {
         self.pipe.core.events.pop_front()
     }
+}
+
+/// A framed 188-byte unit as a packet.
+fn as_packet(unit: &[u8]) -> &Packet {
+    unit.try_into().expect("the framer gives whole packets")
+}
+
+/// A framed unit as its M2TS TP_extra_header (zeros for 188-byte units)
+/// and its packet.
+fn split_unit(unit: &[u8]) -> ([u8; 4], &Packet) {
+    let off = unit.len().saturating_sub(PACKET_SIZE).min(4);
+    let mut rec = [0u8; 4];
+    rec[..off].copy_from_slice(&unit[..off]);
+    let p: &Packet = unit[off..off + PACKET_SIZE].try_into().expect("a unit ends with a packet");
+    (rec, p)
 }
 
 impl Hold {
@@ -1072,6 +1441,7 @@ impl Pipeline {
     /// A framed packet from [`Injector::push`].
     fn bytes_packet<S, F>(
         &mut self,
+        rec: [u8; 4],
         p: &Packet,
         sink: &mut S,
         on_frame: &mut F,
@@ -1081,13 +1451,13 @@ impl Pipeline {
         F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
     {
         if self.hold.is_some() {
-            return self.hold_packet(p, None, sink, on_frame);
+            return self.hold_packet(p, None, rec, sink, on_frame);
         }
-        self.timed(p, sink, on_frame)
+        self.timed(p, rec, sink, on_frame)
     }
 
     /// A packet through the timeline (or straight on without a PCR).
-    fn timed<S, F>(&mut self, p: &Packet, sink: &mut S, on_frame: &mut F) -> Result<(), InjectError>
+    fn timed<S, F>(&mut self, p: &Packet, rec: [u8; 4], sink: &mut S, on_frame: &mut F) -> Result<(), InjectError>
     where
         S: PacketSink + ?Sized,
         F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
@@ -1096,18 +1466,33 @@ impl Pipeline {
         let r = match &mut self.timeline {
             Some(t) => {
                 let mut result = Ok(());
+                // The timeline releases packets in order, so M2TS headers
+                // come off this queue in step.
+                let m2ts = core.cfg.record == RecordFormat::M2ts;
+                if m2ts {
+                    self.recs.push_back(rec);
+                }
+                let recs = &mut self.recs;
                 t.push(p, &mut |tp| {
+                    let rec = if m2ts { recs.pop_front().unwrap_or_default() } else { [0; 4] };
                     if result.is_ok() {
-                        result = core.process(&tp.packet, tp.clock, sink, on_frame);
+                        result = core.process(&tp.packet, tp.clock, rec, sink, on_frame);
                     }
                 });
                 result
             }
-            None => core.process(p, None, sink, on_frame),
+            None => core.process(p, None, rec, sink, on_frame),
         };
         r?;
         self.follow_pcr_pid();
         Ok(())
+    }
+
+    /// A timeline on the target's PCR_PID, in the configured clock mode.
+    fn new_timeline(&self, pid: u16) -> PcrTimeline {
+        PcrTimeline::new(Some(pid), 10_000_000)
+            .with_max_held(self.core.cfg.max_held_packets)
+            .with_mode(self.core.cfg.clock)
     }
 
     /// Keep the timeline on the target's PCR_PID.
@@ -1121,20 +1506,17 @@ impl Pipeline {
         match &mut self.timeline {
             Some(t) if t.pcr_pid() != Some(pid) => t.set_pcr_pid(pid),
             Some(_) => {}
-            None => {
-                self.timeline = Some(
-                    PcrTimeline::new(Some(pid), 10_000_000)
-                        .with_max_held(self.core.cfg.max_held_packets),
-                )
-            }
+            None => self.timeline = Some(self.new_timeline(pid)),
         }
     }
 
-    /// A packet with its clock from [`Injector::push_packet`].
+    /// A packet with its clock from [`Injector::push_packet`] or
+    /// [`Injector::push_record`].
     fn timed_packet<S, F>(
         &mut self,
         p: &Packet,
         clock: Option<u64>,
+        rec: [u8; 4],
         sink: &mut S,
         on_frame: &mut F,
     ) -> Result<(), InjectError>
@@ -1143,9 +1525,9 @@ impl Pipeline {
         F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
     {
         if self.hold.is_some() {
-            return self.hold_packet(p, clock, sink, on_frame);
+            return self.hold_packet(p, clock, rec, sink, on_frame);
         }
-        self.core.process(p, clock, sink, on_frame)
+        self.core.process(p, clock, rec, sink, on_frame)
     }
 
     /// Hold a packet until the target is known; start when it is.
@@ -1153,6 +1535,7 @@ impl Pipeline {
         &mut self,
         p: &Packet,
         clock: Option<u64>,
+        rec: [u8; 4],
         sink: &mut S,
         on_frame: &mut F,
     ) -> Result<(), InjectError>
@@ -1171,7 +1554,7 @@ impl Pipeline {
                 changed |= hold.tables.apply(pid, hold.sections.get(i)) == Applied::Changed;
             }
         }
-        hold.packets.push_back((*p, clock));
+        hold.packets.push_back((*p, clock, rec));
         let full = hold.packets.len() >= self.core.cfg.max_held_packets;
         if changed || full {
             self.try_start(full, sink, on_frame)?;
@@ -1215,24 +1598,22 @@ impl Pipeline {
         self.core.start(hold.tables, hold.observed)?;
         if self.input == Input::Bytes {
             if let Some(pid) = self.core.target().and_then(|t| t.pcr_pid) {
-                self.timeline = Some(
-                    PcrTimeline::new(Some(pid), 10_000_000)
-                        .with_max_held(self.core.cfg.max_held_packets),
-                );
+                self.timeline = Some(self.new_timeline(pid));
             }
         }
-        while let Some((p, clock)) = hold.packets.pop_front() {
+        while let Some((p, clock, rec)) = hold.packets.pop_front() {
             if self.input == Input::Bytes {
-                self.timed(&p, sink, on_frame)?;
+                self.timed(&p, rec, sink, on_frame)?;
             } else {
-                self.core.process(&p, clock, sink, on_frame)?;
+                self.core.process(&p, clock, rec, sink, on_frame)?;
             }
         }
         Ok(())
     }
 
-    /// Process every packet still held: the input held for the tables and
-    /// the internal timeline's last PCR interval.
+    /// Process every packet still held: the input held for the tables, the
+    /// internal timeline's last PCR interval and a video access unit's
+    /// first packets.
     fn flush_held<S, F>(&mut self, sink: &mut S, on_frame: &mut F) -> Result<(), InjectError>
     where
         S: PacketSink + ?Sized,
@@ -1243,14 +1624,16 @@ impl Pipeline {
         }
         if let Some(t) = &mut self.timeline {
             let core = &mut self.core;
+            let recs = &mut self.recs;
             let mut result = Ok(());
             t.flush(&mut |tp| {
+                let rec = recs.pop_front().unwrap_or_default();
                 if result.is_ok() {
-                    result = core.process(&tp.packet, tp.clock, sink, on_frame);
+                    result = core.process(&tp.packet, tp.clock, rec, sink, on_frame);
                 }
             });
             result?;
         }
-        Ok(())
+        self.core.flush_video(sink, on_frame)
     }
 }

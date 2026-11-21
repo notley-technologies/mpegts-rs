@@ -752,6 +752,26 @@ pub unsafe extern "C" fn mpegts_pes_writer_set_sequence_number(
     MPEGTS_OK
 }
 
+/// [`CellNumbering::PerAccessUnit`](crate::mux::CellNumbering::PerAccessUnit): each PES
+/// packet numbers its cells from 0 (the default, DECISIONS X-8).
+pub const MPEGTS_CELLS_PER_AU: u32 = 0;
+/// [`CellNumbering::PerStream`](crate::mux::CellNumbering::PerStream).
+pub const MPEGTS_CELLS_PER_STREAM: u32 = 1;
+
+#[no_mangle]
+pub unsafe extern "C" fn mpegts_pes_writer_set_cell_numbering(
+    writer: *mut mpegts_pes_writer,
+    numbering: u32,
+) -> mpegts_status {
+    let h = check!(mux_mut(writer));
+    h.writer.set_cell_numbering(match numbering {
+        MPEGTS_CELLS_PER_AU => crate::mux::CellNumbering::PerAccessUnit,
+        MPEGTS_CELLS_PER_STREAM => crate::mux::CellNumbering::PerStream,
+        _ => return MPEGTS_ERR_INVALID,
+    });
+    MPEGTS_OK
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn mpegts_null_packet(packet: *mut u8) -> mpegts_status {
     if packet.is_null() {
@@ -820,7 +840,12 @@ mod tests {
             ts.extend_from_slice(&buf[..written]);
             let mut seq = 9;
             assert_eq!(mpegts_pes_writer_sequence_number(w, &mut seq), MPEGTS_OK);
-            assert_eq!(seq, 1);
+            assert_eq!(seq, 0, "cells numbered per access unit (DECISIONS X-8)");
+            assert_eq!(mpegts_pes_writer_set_cell_numbering(w, 7), MPEGTS_ERR_INVALID);
+            assert_eq!(mpegts_pes_writer_set_cell_numbering(w, MPEGTS_CELLS_PER_STREAM), MPEGTS_OK);
+            assert_eq!(mpegts_pes_writer_sequence_number(w, &mut seq), MPEGTS_OK);
+            assert_eq!(seq, 1, "the per-stream counter went on");
+            assert_eq!(mpegts_pes_writer_set_cell_numbering(w, MPEGTS_CELLS_PER_AU), MPEGTS_OK);
             unit.flags = 0x80;
             assert_eq!(mpegts_pes_writer_write(w, &unit, buf.as_mut_ptr(), buf.len(), &mut written), MPEGTS_ERR_INVALID);
             assert_eq!(mpegts_pes_writer_write_adaptation_only(w, MPEGTS_PES_HAS_PCR, 0, buf.as_mut_ptr(), 188, &mut written), MPEGTS_ERR_INVALID);

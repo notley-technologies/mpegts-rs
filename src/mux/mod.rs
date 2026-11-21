@@ -21,7 +21,11 @@
 //! - [`Injector`]: built on the above, inserts KLV into an existing
 //!   transport stream as it passes through (pass-through invariant, PSI
 //!   rewrite, the T-STD insertion window, VBR or strict CBR), with
-//!   [`FrameReorder`] to give per-frame metadata presentation order.
+//!   [`FrameReorder`] to give per-frame metadata presentation order. It
+//!   can also read and write SEI user data in the video, such as MISB ST
+//!   0604 timestamps ([`VideoSei`]), take and write 192-byte M2TS records
+//!   ([`RecordFormat`]), and time live input without holding it
+//!   ([`ClockMode::Extrapolate`]).
 //!
 //! Every writer emits whole 188-byte packets into a [`PacketSink`]: a
 //! closure, a `Vec<u8>`, or a fixed buffer through [`SliceSink`]. Writing
@@ -75,18 +79,20 @@ mod sink;
 mod spec;
 mod ts;
 
-pub use cells::{CellFragment, CellHeader, CELL_HEADER_LEN, MAX_CELL_DATA};
+pub use cells::{CellFragment, CellHeader, CellNumbering, CELL_HEADER_LEN, MAX_CELL_DATA};
 pub use error::MuxError;
+pub use crate::ClockMode;
 pub use inject::{
     DropReason, ExistingKlv, Frame, FrameReorder, InjectConfig, InjectError, InjectEvent, InjectStats, InjectWarning,
-    Injector, InsertUnit, KlvCarriage, OnOverflow, ProgramSelect, RateMode, Target, Units,
+    Injector, InsertUnit, KlvCarriage, OnOverflow, ProgramSelect, RateMode, RecordFormat, Target, Units, UserDataSkip,
+    VideoPrefix, VideoSei, DEFAULT_VIDEO_SEI_MAX_PREFIX, MAX_USER_DATA_PAYLOAD,
 };
 pub use pes::{Carriage, PesUnit, PesWriter, MAX_ASYNC_PES_DATA};
 pub use psi::{
     write_descriptor, write_pat_section, write_pmt_section, PatEntry, PmtEntry, ProgramDef, ProgramTables,
     StreamDef, MAX_PSI_SECTION_LEN,
 };
-pub use sink::{Packet, PacketSink, SliceSink};
+pub use sink::{Packet, PacketSink, Record, RecordFn, SliceSink, M2TS_RECORD_SIZE};
 pub use spec::{
     klv_metadata_descriptor, klv_metadata_pointer_descriptor, metadata_std_descriptor, StreamSpec,
     SyncKlvOptions, KLVA, KLVA_REGISTRATION_DESCRIPTOR, METADATA_STD_DESCRIPTOR,

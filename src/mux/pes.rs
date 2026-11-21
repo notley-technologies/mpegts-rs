@@ -1,7 +1,7 @@
 //! PES packets of one elementary stream (ISO/IEC 13818-1 2.4.3.6, 2.4.3.7),
 //! in the carriage its stream calls for.
 
-use super::cells::{CellFragment, CellHeader, CELL_HEADER_LEN, MAX_CELL_DATA};
+use super::cells::{CellFragment, CellHeader, CellNumbering, CELL_HEADER_LEN, MAX_CELL_DATA};
 use super::sink::{check_room, PacketSink};
 use super::spec::StreamSpec;
 use super::ts::{af_body, packet_count, AdaptationFlags, TsWriter};
@@ -150,6 +150,7 @@ struct Plan {
     flags: AdaptationFlags,
     len: usize,
     sequence: u8,
+    numbering: CellNumbering,
 }
 
 /// One PES packet of a plan.
@@ -225,8 +226,14 @@ impl Iterator for Segments {
                 let length = 3 + 5 + CELL_HEADER_LEN + n;
                 seg.header_len = write_header(&mut seg.header, p.stream_id, length, true, first, p.pts, None);
                 let fragment = CellFragment::of(self.index, p.cells());
-                // sequence_number +1 per cell, modulo 256 (R-ISO13818-140).
-                let sequence = p.sequence.wrapping_add(self.index as u8);
+                // sequence_number: from 0 at the start of the access unit,
+                // +1 per fragment (DECISIONS X-8), so a complete access unit
+                // is cell 0 of its PES packet; or per stream, +1 per cell
+                // modulo 256 (R-ISO13818-140).
+                let sequence = match p.numbering {
+                    CellNumbering::PerAccessUnit => self.index as u8,
+                    CellNumbering::PerStream => p.sequence.wrapping_add(self.index as u8),
+                };
                 seg.cell = Some(CellHeader::new(service_id, sequence, fragment, n as u16).to_bytes());
                 n
             }
@@ -319,7 +326,8 @@ fn write_header(
 /// let mut sink = SliceSink::new(&mut buf);
 /// let packets = writer.write(&PesUnit::new(&klv).with_pts(900_000), &mut sink)?;
 /// assert_eq!(packets, 1);
-/// assert_eq!(writer.sequence_number(), 1);
+/// // Each access unit's cells are numbered from 0 (DECISIONS X-8).
+/// assert_eq!(writer.sequence_number(), 0);
 /// # Ok::<(), mpegts::mux::MuxError>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,8 +335,9 @@ pub struct PesWriter {
     ts: TsWriter,
     stream_id: u8,
     carriage: Carriage,
-    /// sequence_number of the next metadata cell.
+    /// The per-stream cell counter ([`CellNumbering::PerStream`]).
     sequence: u8,
+    numbering: CellNumbering,
 }
 
 impl PesWriter {
@@ -345,7 +354,7 @@ impl PesWriter {
             return Err(MuxError::InvalidPid { pid, reason: "elementary stream PIDs are 0x0010 to 0x1FFE" });
         }
         StreamSpec::check_pes(stream_id, carriage)?;
-        Ok(PesWriter { ts: TsWriter::new(pid)?, stream_id, carriage, sequence: 0 })
+        Ok(PesWriter { ts: TsWriter::new(pid)?, stream_id, carriage, sequence: 0, numbering: CellNumbering::PerAccessUnit })
     }
 
     /// Synchronous KLV on `pid` (stream_id 0xFC, metadata cells for
@@ -387,17 +396,32 @@ impl PesWriter {
         &mut self.ts
     }
 
-    /// The sequence_number of the next metadata cell (0 for a new
-    /// writer).
+    /// The sequence_number the next access unit's first cell gets: always 0
+    /// with [`CellNumbering::PerAccessUnit`] (the default), the stream's
+    /// counter with [`CellNumbering::PerStream`].
     pub fn sequence_number(&self) -> u8 {
-        self.sequence
+        match self.numbering {
+            CellNumbering::PerAccessUnit => 0,
+            CellNumbering::PerStream => self.sequence,
+        }
     }
 
-    /// Continue an existing stream's cell numbering: when taking over a
-    /// metadata PID, start from the last input sequence_number + 1 so
-    /// receivers see no loss (D-ISO13818-07).
+    /// Set the per-stream counter ([`CellNumbering::PerStream`]): when
+    /// taking over a metadata PID numbered per stream, start from the last
+    /// input sequence_number + 1 so receivers see no loss (D-ISO13818-07).
+    /// No effect on cells numbered per access unit.
     pub fn set_sequence_number(&mut self, next: u8) {
         self.sequence = next;
+    }
+
+    /// How cell sequence numbers are counted.
+    pub fn cell_numbering(&self) -> CellNumbering {
+        self.numbering
+    }
+
+    /// Count cell sequence numbers this way from the next cell on.
+    pub fn set_cell_numbering(&mut self, numbering: CellNumbering) {
+        self.numbering = numbering;
     }
 
     /// Check `unit` against the carriage's rules.
@@ -412,6 +436,7 @@ impl PesWriter {
             flags: unit.adaptation,
             len: unit.data.len(),
             sequence: self.sequence,
+            numbering: self.numbering,
         };
         if unit.service_id.is_some() && !matches!(self.carriage, Carriage::MetadataCells { .. }) {
             return invalid("a metadata_service_id applies only to metadata cell carriage");
@@ -584,6 +609,7 @@ mod tests {
             flags: AdaptationFlags::default(),
             len,
             sequence: 250,
+            numbering: CellNumbering::PerStream,
         };
         let pes = Mode::Pes { optional_header: true, video: false };
         // 65527 bytes fit beside a PTS; one more splits.
@@ -605,6 +631,11 @@ mod tests {
         assert_eq!(heads[0], [7, 250, 0x9F, 0xFF, 0xF2]);
         assert_eq!(heads[1], [7, 251, 0x0F, 0xFF, 0xF2]);
         assert_eq!(heads[2], [7, 252, 0x4F, 0x00, 0x01]);
+        // Per access unit (the default, DECISIONS X-8): from 0, +1 per
+        // fragment.
+        let per_au = Plan { numbering: CellNumbering::PerAccessUnit, ..plan(65_522 * 2 + 1, cells, Some(5)) };
+        let heads: Vec<[u8; 5]> = per_au.segments().map(|s| s.cell.unwrap()).collect();
+        assert_eq!(heads.iter().map(|h| h[1]).collect::<Vec<_>>(), [0, 1, 2]);
         // DECISIONS X-6: data_alignment_indicator only on the first PES.
         assert!(segs.iter().all(|s| s.header[7] == 0x80));
         assert_eq!(segs.iter().map(|s| s.header[6]).collect::<Vec<_>>(), [0x85, 0x81, 0x81]);

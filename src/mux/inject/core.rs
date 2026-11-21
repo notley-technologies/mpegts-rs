@@ -1,15 +1,20 @@
 //! The injector's per-packet engine: what each input packet becomes, when
 //! PSI copies and KLV units go out, and the T-STD bookkeeping behind those
-//! decisions.
+//! decisions; and, with video SEI on, the hold of each video access unit's
+//! first packets and the re-packetization of a PES the frame callback
+//! wrote into.
 
+use super::m2ts::Stamper;
 use super::plan::{plan, rewrite_pmt, Plan, PlanInput};
 use super::tables::{Applied, Pids, Sections, Tables, PAT_PID};
+use super::video::{AuContext, Held, PrefixReader, Reflow};
 use super::{
     DropReason, Frame, InjectConfig, InjectError, InjectEvent, InjectStats, InjectWarning,
-    InsertUnit, KlvCarriage, OnOverflow, RateMode, Target, Units,
+    InsertUnit, KlvCarriage, OnOverflow, RateMode, RecordFormat, Target, Units, UserDataSkip,
+    VideoSei,
 };
 use crate::mux::{
-    Carriage, Packet, PacketSink, PesUnit, PesWriter, TsWriter, MAX_CELL_DATA, NULL_PACKET,
+    Carriage, CellNumbering, Packet, PacketSink, PesUnit, PesWriter, TsWriter, MAX_CELL_DATA, NULL_PACKET,
 };
 use crate::packet::{pcr_delta, pts_delta, PacketHeader, PesHeader, NULL_PID, PCR_WRAP, PTS_WRAP};
 use crate::{PACKET_SIZE, PCR_HZ};
@@ -295,8 +300,10 @@ enum PesState {
 }
 
 /// Joining an existing synchronous KLV stream (st1402-time.md D-5): its
-/// continuity counters and cell sequence numbers are renumbered so that
-/// ours fit in; access unit bytes are never changed.
+/// continuity counters are renumbered so that ours fit in, and with
+/// [`CellNumbering::PerStream`] its cell sequence numbers too (with the
+/// default, each PES packet numbers its own cells, so the input's stay as
+/// they are; DECISIONS X-8); access unit bytes are never changed.
 #[derive(Debug)]
 struct Merge {
     pid: u16,
@@ -307,8 +314,11 @@ struct Merge {
     len_hi: u8,
     /// PES header bytes seen (for the PTS).
     head: [u8; 14],
-    /// Next cell sequence_number of the stream (R-ISO13818-140).
+    /// Next cell sequence_number of the stream (R-ISO13818-140), with
+    /// [`CellNumbering::PerStream`].
     seq: Option<u8>,
+    /// Renumber the input's cells (per-stream numbering).
+    renumber: bool,
     /// Continuity counter of the last packet written, and the input's
     /// counter of the last input packet written.
     out_cc: Option<u8>,
@@ -328,10 +338,13 @@ struct Merge {
 }
 
 impl Merge {
-    fn new(pid: u16, service_id: u8, last_cc: Option<u8>) -> Result<Self, InjectError> {
+    fn new(pid: u16, service_id: u8, last_cc: Option<u8>, numbering: CellNumbering) -> Result<Self, InjectError> {
+        let mut writer = PesWriter::with_carriage(pid, 0xFC, Carriage::MetadataCells { service_id })?;
+        writer.set_cell_numbering(numbering);
         Ok(Merge {
             pid,
-            writer: PesWriter::with_carriage(pid, 0xFC, Carriage::MetadataCells { service_id })?,
+            writer,
+            renumber: numbering == CellNumbering::PerStream,
             state: PesState::Unknown,
             cell: 0,
             len_hi: 0,
@@ -353,8 +366,9 @@ impl Merge {
         self.state == PesState::Idle
     }
 
-    /// Track an input packet of the merged PID, in output order, and
-    /// renumber the sequence_number of every cell it holds.
+    /// Track an input packet of the merged PID, in output order, and with
+    /// per-stream numbering renumber the sequence_number of every cell it
+    /// holds.
     fn take_input(&mut self, p: &mut Packet) {
         if p[1] & 0x80 != 0 {
             self.state = PesState::Unknown;
@@ -426,7 +440,7 @@ impl Merge {
                     self.services[usize::from(b)] = true;
                     self.saw_ours |= b == self.our_service;
                 }
-                1 => {
+                1 if self.renumber => {
                     // One sequence_number counter per stream, whatever the
                     // service (R-ISO13818-140, D-ISO13818-07): continue the
                     // input's numbering, counting our cells too.
@@ -596,8 +610,90 @@ pub(super) struct Core {
     /// packets that keep its PCR.
     af_cc: Vec<(u16, u8)>,
     async_head_since: Option<u64>,
+    /// Video SEI state (boxed: the pass-through path never touches it).
+    video: Box<VideoState>,
+    /// What the frame callback of the first released packet sees.
+    pending_au: Option<Box<AuContext>>,
+    /// A reflow ran: video packets may need changing (stays set, since
+    /// continuity counter offsets stay).
+    video_touched: bool,
+    /// M2TS output, and its TP_extra_headers.
+    rec_on: bool,
+    rec: Box<Stamper>,
     pub stats: InjectStats,
     pub events: VecDeque<InjectEvent>,
+}
+
+/// Video SEI state of a [`Core`].
+#[derive(Debug)]
+struct VideoState {
+    /// A video access unit's first packets, held until its prefix is read
+    /// (and, in CBR with VideoSei::Write, until its PES ends).
+    hold: Option<VideoHold>,
+    /// The held packets after the first, while they are processed.
+    releasing: VecDeque<Held>,
+    /// The video PES being re-packetized after a write.
+    reflow: Option<Reflow>,
+    /// Per-PID continuity counter offset of the video packets after
+    /// packets added to a PID (or taken away from it).
+    cc_offset: [u8; 0x2000],
+    /// Continuity counter of the last packet written on the reflow's PID.
+    last_cc: Option<u8>,
+    /// Video packets added: before the current input packet's slot (the
+    /// rest of the previous PES) and after it (the PES ended with it).
+    before: Vec<Packet>,
+    after: Vec<Packet>,
+}
+
+/// A video access unit's first packets, with what is read of its prefix.
+#[derive(Debug)]
+struct VideoHold {
+    pid: u16,
+    reader: PrefixReader,
+    /// VideoSei::Write and stream_type 0x1B or 0x24.
+    writable: bool,
+    packets: VecDeque<Held>,
+    /// Hold the whole PES, not only its prefix.
+    whole: bool,
+    /// Input PES bytes seen, and its total when PES_packet_length is not
+    /// 0.
+    pes_bytes: usize,
+    pes_total: Option<usize>,
+}
+
+impl VideoHold {
+    fn push(&mut self, held: Held) {
+        if let Ok(h) = PacketHeader::parse(&held.0) {
+            if h.pid == self.pid && h.has_payload() {
+                let payload = h.payload(&held.0);
+                self.reader.add(payload);
+                self.pes_bytes += payload.len();
+                if self.pes_ended() {
+                    self.reader.stop(true);
+                }
+            }
+        }
+        self.packets.push_back(held);
+    }
+
+    fn pes_ended(&self) -> bool {
+        self.pes_total.is_some_and(|t| self.pes_bytes >= t)
+    }
+
+    /// The next PES on the PID starts with `p`: the held one ended.
+    fn ended_by(&self, p: &Packet) -> bool {
+        p[0] == crate::SYNC_BYTE && u16::from_be_bytes([p[1] & 0x1F, p[2]]) == self.pid && p[1] & 0xC0 == 0x40
+    }
+
+    /// Whether to release now. A whole PES is held up to the next PES on
+    /// the PID, so the null packets after its last packet count as room.
+    fn ready(&mut self, max_held: usize) -> bool {
+        if self.packets.len() >= max_held {
+            self.reader.stop(false);
+            return true;
+        }
+        self.reader.done() && !self.whole
+    }
 }
 
 impl Core {
@@ -659,10 +755,28 @@ impl Core {
             slots: Slots::default(),
             af_cc: Vec::new(),
             async_head_since: None,
+            video: Box::new(VideoState {
+                hold: None,
+                releasing: VecDeque::new(),
+                reflow: None,
+                cc_offset: [0; 0x2000],
+                last_cc: None,
+                before: Vec::new(),
+                after: Vec::new(),
+            }),
+            pending_au: None,
+            video_touched: false,
+            rec_on: cfg.record == RecordFormat::M2ts,
+            rec: Box::new(Stamper::new()),
             stats: InjectStats::default(),
             events: VecDeque::new(),
             cfg,
         }
+    }
+
+    /// Input packets held for video access unit prefixes.
+    pub fn video_held(&self) -> usize {
+        self.video.hold.as_ref().map_or(0, |h| h.packets.len()) + self.video.releasing.len()
     }
 
     pub fn target(&self) -> Option<&Target> {
@@ -747,6 +861,15 @@ impl Core {
             own_changes: self.own_changes,
             cell_services: &cell_services,
         })?;
+        if let (Some(n), VideoSei::Write) = (&new, self.cfg.video_sei) {
+            // ST 0604 SEI is written into H.264 and H.265 only
+            // (MUXING_PLAN 6.8, R-ST1402TIME-75).
+            if !matches!(n.target.video_stream_type, Some(0x1B | 0x24)) {
+                return Err(InjectError::Unsupported(
+                    "VideoSei::Write needs H.264 (stream_type 0x1B) or H.265 (stream_type 0x24) video in the target program",
+                ));
+            }
+        }
         let old = self.plan.take();
         match (&old, &new) {
             (Some(o), None) => self.event(InjectEvent::TargetLost {
@@ -814,7 +937,7 @@ impl Core {
                     .as_ref()
                     .filter(|m| m.pid == t.klv_pid)
                     .map(|m| (m.seq, m.out_cc, m.in_cc));
-                let mut m = Merge::new(t.klv_pid, t.service_id.unwrap_or(0), last_cc)?;
+                let mut m = Merge::new(t.klv_pid, t.service_id.unwrap_or(0), last_cc, self.cfg.sync.cell_numbering)?;
                 if let Some((seq, out_cc, in_cc)) = keep {
                     m.seq = seq;
                     m.out_cc = out_cc;
@@ -827,6 +950,7 @@ impl Core {
                     KlvCarriage::Sync => PesWriter::klv_sync(t.klv_pid, t.service_id.unwrap_or(0))?,
                     KlvCarriage::Async => PesWriter::klv_async(t.klv_pid)?,
                 };
+                w.set_cell_numbering(self.cfg.sync.cell_numbering);
                 match self.klv_writer.as_ref().filter(|w| w.pid() == t.klv_pid) {
                     // Same PID, new service id: the stream continues.
                     Some(old) => {
@@ -898,11 +1022,15 @@ impl Core {
 
     // ------------------------------------------------------------ packets
 
-    /// One input packet with its program clock.
+    /// One input packet with its program clock and its M2TS
+    /// TP_extra_header (zeros for 188-byte input). With video SEI on, the
+    /// first packets of each video access unit are held until its prefix
+    /// is read (MUXING_PLAN 6.8).
     pub fn process<S, F>(
         &mut self,
         p: &Packet,
         clock: Option<u64>,
+        rec: [u8; 4],
         sink: &mut S,
         on_frame: &mut F,
     ) -> Result<(), InjectError>
@@ -910,11 +1038,154 @@ impl Core {
         S: PacketSink + ?Sized,
         F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
     {
+        if self.cfg.video_sei != VideoSei::Off && self.video_hold(p, clock, rec, sink, on_frame)? {
+            return Ok(());
+        }
+        self.process_one(p, clock, rec, sink, on_frame)
+    }
+
+    /// The video hold: whether it took `p`, releasing what it held when
+    /// the prefix is read or the PES ended.
+    #[inline(never)]
+    fn video_hold<S, F>(
+        &mut self,
+        p: &Packet,
+        clock: Option<u64>,
+        rec: [u8; 4],
+        sink: &mut S,
+        on_frame: &mut F,
+    ) -> Result<bool, InjectError>
+    where
+        S: PacketSink + ?Sized,
+        F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
+    {
+        if let Some(hold) = &mut self.video.hold {
+            if !hold.ended_by(p) {
+                hold.push((*p, clock, rec));
+                if hold.ready(self.cfg.max_held_packets) {
+                    self.release_video(false, sink, on_frame)?;
+                }
+                return Ok(true);
+            }
+            self.release_video(true, sink, on_frame)?;
+        }
+        if let Some(hold) = self.video_start(p, clock, rec) {
+            self.video.hold = Some(hold);
+            if self.video.hold.as_mut().is_some_and(|h| h.ready(self.cfg.max_held_packets)) {
+                self.release_video(false, sink, on_frame)?;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// A hold for the access unit that `p` starts, when it is the first
+    /// packet of a video PES with a PTS whose format the injector reads.
+    fn video_start(&self, p: &Packet, clock: Option<u64>, rec: [u8; 4]) -> Option<VideoHold> {
+        let h = PacketHeader::parse(p).ok()?;
+        if self.roles[usize::from(h.pid)] & R_VIDEO == 0
+            || !h.payload_unit_start
+            || h.transport_error
+            || h.scrambling != 0
+        {
+            return None;
+        }
+        let pes = PesHeader::parse(h.payload(p)).ok()?;
+        if pes.pts.is_none() || pes.scrambling != 0 {
+            return None;
+        }
+        let target = &self.plan.as_ref()?.target;
+        let codec = target.video_codec?;
+        let writable =
+            self.cfg.video_sei == VideoSei::Write && matches!(target.video_stream_type, Some(0x1B | 0x24));
+        let mut hold = VideoHold {
+            pid: h.pid,
+            reader: PrefixReader::new(codec, self.cfg.video_sei_max_prefix),
+            writable,
+            packets: VecDeque::new(),
+            // CBR: the room is in this PES and the null packets between
+            // its packets, so all of it is held (MUXING_PLAN 6.9).
+            whole: writable && self.cbr.is_some(),
+            pes_bytes: 0,
+            pes_total: pes.total_length(),
+        };
+        hold.push((*p, clock, rec));
+        Some(hold)
+    }
+
+    /// Process the held packets of a video access unit; the first one's
+    /// frame callback sees what was read of the prefix.
+    #[inline(never)]
+    fn release_video<S, F>(&mut self, pes_ended: bool, sink: &mut S, on_frame: &mut F) -> Result<(), InjectError>
+    where
+        S: PacketSink + ?Sized,
+        F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
+    {
+        let Some(hold) = self.video.hold.take() else {
+            return Ok(());
+        };
+        let VideoHold {
+            mut reader,
+            writable,
+            mut packets,
+            ..
+        } = hold;
+        reader.stop(pes_ended);
+        self.pending_au = Some(Box::new(reader.finish(self.cfg.video_sei, writable)));
+        let first = packets.pop_front();
+        self.video.releasing = packets;
+        if let Some((p, clock, rec)) = first {
+            self.process_one(&p, clock, rec, sink, on_frame)?;
+        }
+        while let Some((p, clock, rec)) = self.video.releasing.pop_front() {
+            self.process_one(&p, clock, rec, sink, on_frame)?;
+        }
+        Ok(())
+    }
+
+    /// End of input: release a held access unit, end the PES being
+    /// re-packetized, stamp the last added M2TS records.
+    pub fn flush_video<S, F>(&mut self, sink: &mut S, on_frame: &mut F) -> Result<(), InjectError>
+    where
+        S: PacketSink + ?Sized,
+        F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
+    {
+        if self.video.hold.is_some() {
+            self.release_video(false, sink, on_frame)?;
+        }
+        if self.video.reflow.is_some() {
+            self.close_reflow(true);
+        }
+        self.write_video_extra(sink)?;
+        self.rec.finish(sink);
+        Ok(())
+    }
+
+    /// One input packet, after any video hold.
+    fn process_one<S, F>(
+        &mut self,
+        p: &Packet,
+        clock: Option<u64>,
+        rec: [u8; 4],
+        sink: &mut S,
+        on_frame: &mut F,
+    ) -> Result<(), InjectError>
+    where
+        S: PacketSink + ?Sized,
+        F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
+    {
+        if self.rec_on {
+            self.rec.begin(rec);
+        }
         self.stats.packets_in += 1;
         self.clock.advance(clock);
         let Ok(h) = PacketHeader::parse(p) else {
             // Not a valid packet (push_packet input): pass it on.
-            return self.write_slot(Slot::Keep, p, sink);
+            self.write_slot(Slot::Keep, p, sink)?;
+            if self.rec_on {
+                self.rec.end_packet(sink);
+            }
+            return Ok(());
         };
         let pid = h.pid;
         let roles = self.roles[usize::from(pid)];
@@ -949,7 +1220,7 @@ impl Core {
         }
 
         let mut frame = None;
-        let slot = if pid == NULL_PID {
+        let mut slot = if pid == NULL_PID {
             self.stats.null_packets += 1;
             Slot::Free { null: true }
         } else if roles & (R_PAT | R_PMT_OWNED) != 0 {
@@ -1004,16 +1275,263 @@ impl Core {
                 self.max_video_pts = Some(f.pts);
             }
             frame_pts = Some(f.pts);
+            // What was read of this access unit's prefix (the first packet
+            // of a released video hold).
+            let mut au = self.pending_au.take();
             let mut units = Units {
                 queue: &mut self.queue,
                 clock: self.clock.now,
                 target: self.plan.as_ref().map(|pl| &pl.target),
+                au: au.as_deref_mut(),
             };
             on_frame(&f, &mut units);
+            if let Some(au) = au.take() {
+                self.apply_au(&au, p, f.pts)?;
+            }
+        } else if self.pending_au.is_some() {
+            self.pending_au = None;
         }
         let merged_start = roles & R_MERGED != 0 && h.payload_unit_start;
         self.schedule(frame_pts, merged_start, new_base)?;
-        self.write_slot(slot, p, sink)
+        if self.video_touched {
+            self.video_step(p, &h, &mut slot);
+        }
+        self.write_slot(slot, p, sink)?;
+        if self.rec_on {
+            self.rec.end_packet(sink);
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ video
+
+    /// After the frame callback of a scanned access unit: count, and set
+    /// up the write it asked for (st1402-time.md D-12, D-13).
+    fn apply_au(&mut self, au: &AuContext, p0: &Packet, pts: u64) -> Result<(), InjectError> {
+        self.stats.frames_scanned += 1;
+        self.stats.user_data_found += au.user_data.len() as u64;
+        if au.refused {
+            self.user_data_skipped(pts, UserDataSkip::Incomplete);
+        }
+        let Some(edit) = au.edit() else {
+            return Ok(());
+        };
+        let pid = u16::from_be_bytes([p0[1] & 0x1F, p0[2]]);
+        let reflow = match Reflow::new(pid, edit, au.pes_length()) {
+            Ok(r) => r,
+            Err(why) => {
+                self.user_data_skipped(pts, why);
+                return Ok(());
+            }
+        };
+        if self.cbr.is_some() && !self.cbr_room(&reflow, p0) {
+            if self.cbr == Some(OnOverflow::DropOldest) {
+                self.user_data_skipped(pts, UserDataSkip::NoRoom);
+                return Ok(());
+            }
+            return Err(InjectError::CbrOverflow {
+                pts: Some(pts),
+                packets: (reflow.added() + 183) / 184,
+                free_per_second: (self.slots.rate * PCR_HZ as f64) as u64,
+            });
+        }
+        if reflow.rewrite() {
+            self.stats.user_data_rewritten += 1;
+        } else {
+            self.stats.user_data_inserted += 1;
+        }
+        // The previous PES of a still running re-packetization ends here.
+        self.close_reflow(false);
+        self.video.reflow = Some(reflow);
+        self.video_touched = true;
+        Ok(())
+    }
+
+    fn user_data_skipped(&mut self, pts: u64, reason: UserDataSkip) {
+        self.stats.user_data_skipped += 1;
+        self.event(InjectEvent::Warning(InjectWarning::UserDataSkipped { pts, reason }));
+    }
+
+    /// Whether the held window (this packet and the ones held after it)
+    /// has room for the reflow's added bytes in CBR: adaptation field
+    /// stuffing of the PES's packets, then null packets after the
+    /// insertion point (MUXING_PLAN 6.9, R-ST1402TIME-05). The same steps
+    /// as [`video_step`](Self::video_step), on a copy.
+    fn cbr_room(&self, reflow: &Reflow, p0: &Packet) -> bool {
+        let mut r = reflow.clone();
+        let step = |r: &mut Reflow, p: &Packet| -> Option<bool> {
+            let h = PacketHeader::parse(p).ok()?;
+            if h.pid == r.pid {
+                if h.payload_unit_start && r.started {
+                    return Some(r.carry.is_empty());
+                }
+                if h.has_payload() {
+                    r.take(p, h.payload_offset);
+                    if r.done() {
+                        return Some(true);
+                    }
+                }
+            } else if h.pid == NULL_PID && r.started && !r.carry.is_empty() {
+                let _ = r.carried_packet(0);
+                if r.done() {
+                    return Some(true);
+                }
+            }
+            None
+        };
+        if let Some(ok) = step(&mut r, p0) {
+            return ok;
+        }
+        for (p, _, _) in &self.video.releasing {
+            if let Some(ok) = step(&mut r, p) {
+                return ok;
+            }
+        }
+        r.carry.is_empty()
+    }
+
+    /// What a packet becomes when a video PES is being re-packetized or the
+    /// video PID's continuity counters are renumbered (R-ST1402TIME-11):
+    /// its bytes re-flowed and its counter moved; in CBR, a null packet
+    /// that takes carried bytes.
+    fn video_step(&mut self, p: &Packet, h: &PacketHeader, slot: &mut Slot) {
+        let pid = h.pid;
+        if pid == NULL_PID {
+            if self.cbr.is_none() {
+                return;
+            }
+            let Some(r) = self.video.reflow.as_mut().filter(|r| r.started && !r.carry.is_empty()) else {
+                return;
+            };
+            let cc = self.video.last_cc.map_or(0, |c| (c + 1) & 0x0F);
+            let Some(q) = r.carried_packet(cc) else {
+                return;
+            };
+            let at = usize::from(r.pid);
+            let done = r.done();
+            self.video.cc_offset[at] = (self.video.cc_offset[at] + 1) & 0x0F;
+            self.video.last_cc = Some(cc);
+            self.stats.video_slots_filled += 1;
+            if done {
+                self.video.reflow = None;
+            }
+            *slot = Slot::Replace(q);
+            return;
+        }
+        let reflowing = self.video.reflow.as_ref().is_some_and(|r| r.pid == pid);
+        if (!reflowing && self.video.cc_offset[usize::from(pid)] == 0) || !matches!(slot, Slot::Keep) {
+            return;
+        }
+        if reflowing && h.payload_unit_start && self.video.reflow.as_ref().is_some_and(|r| r.started) {
+            // The next PES: the rest of this one goes out first.
+            self.close_reflow(false);
+        }
+        let mut q = *p;
+        if let Some(r) = self.video.reflow.as_mut().filter(|r| r.pid == pid) {
+            if h.has_payload() {
+                q = r.take(p, h.payload_offset);
+                if q[3] & 0x10 == 0 {
+                    // Nothing left for it to carry: it no longer counts.
+                    let at = usize::from(pid);
+                    self.video.cc_offset[at] = self.video.cc_offset[at].wrapping_sub(1) & 0x0F;
+                }
+            }
+        }
+        let off = self.video.cc_offset[usize::from(pid)];
+        if off != 0 {
+            q[3] = (q[3] & 0xF0) | (((q[3] & 0x0F) + off) & 0x0F);
+        }
+        if let Some(r) = self.video.reflow.as_ref().filter(|r| r.pid == pid) {
+            self.video.last_cc = Some(q[3] & 0x0F);
+            // VBR: what is left goes out right after the PES's last packet.
+            // CBR: null packets after it take the rest (PES_packet_length
+            // counts them already).
+            if r.done() || (r.ended() && self.cbr.is_none()) {
+                self.close_reflow(true);
+            }
+        }
+        if q != *p {
+            *slot = Slot::Replace(q);
+        }
+    }
+
+    /// End the re-packetization: the bytes still carried go into packets
+    /// of their own, before the current slot (the next PES started) or
+    /// after it (the PES ended with it).
+    fn close_reflow(&mut self, after: bool) {
+        let Some(mut r) = self.video.reflow.take() else {
+            return;
+        };
+        let at = usize::from(r.pid);
+        let mut cc = self.video.last_cc.unwrap_or(0);
+        loop {
+            let next = (cc + 1) & 0x0F;
+            let Some(q) = r.carried_packet(next) else {
+                break;
+            };
+            cc = next;
+            self.video.cc_offset[at] = (self.video.cc_offset[at] + 1) & 0x0F;
+            if after {
+                self.video.after.push(q);
+            } else {
+                self.video.before.push(q);
+            }
+        }
+        self.video.last_cc = None;
+    }
+
+    /// Write the added video packets now (end of input).
+    fn write_video_extra<S: PacketSink + ?Sized>(&mut self, sink: &mut S) -> Result<(), InjectError> {
+        if self.video.before.is_empty() && self.video.after.is_empty() {
+            return Ok(());
+        }
+        if self.cbr.is_some() {
+            return Err(self.video_cbr_error());
+        }
+        let mut v = std::mem::take(&mut self.video.before);
+        v.append(&mut self.video.after);
+        for q in &v {
+            self.write_video(q, sink);
+        }
+        v.clear();
+        self.video.before = v;
+        Ok(())
+    }
+
+    fn write_video<S: PacketSink + ?Sized>(&mut self, q: &Packet, sink: &mut S) {
+        self.stats.video_packets_added += 1;
+        self.stats.packets_out += 1;
+        self.out_inserted(q, sink);
+    }
+
+    /// CBR may never add packets; the room check makes this unreachable.
+    fn video_cbr_error(&self) -> InjectError {
+        InjectError::CbrOverflow {
+            pts: None,
+            packets: self.video.before.len() + self.video.after.len(),
+            free_per_second: (self.slots.rate * PCR_HZ as f64) as u64,
+        }
+    }
+
+    /// A packet the injector adds: written now, or (VBR M2TS) stamped once
+    /// the input record it precedes is known.
+    fn out_inserted<S: PacketSink + ?Sized>(&mut self, q: &Packet, sink: &mut S) {
+        if !self.rec_on {
+            sink.packet(q);
+        } else if self.cbr.is_some() {
+            self.rec.slot(q, sink);
+        } else {
+            self.rec.inserted(q);
+        }
+    }
+
+    /// The packet in the current input packet's place.
+    fn out_slot<S: PacketSink + ?Sized>(&mut self, q: &Packet, sink: &mut S) {
+        if self.rec_on {
+            self.rec.slot(q, sink);
+        } else {
+            sink.packet(q);
+        }
     }
 
     /// An adaptation-field-only packet keeping the PCR of a removed stream
@@ -1598,13 +2116,13 @@ impl Core {
         if kind != Kind::Psi && o.flags & O_UNIT_LAST != 0 {
             self.stats.units_inserted += 1;
         }
-        sink.packet(&o.p);
+        self.out_inserted(&o.p, sink);
         self.stats.packets_out += 1;
         Ok(())
     }
 
     fn write_input<S: PacketSink + ?Sized>(&mut self, p: &Packet, sink: &mut S) {
-        sink.packet(p);
+        self.out_slot(p, sink);
         self.stats.packets_out += 1;
     }
 
@@ -1616,8 +2134,18 @@ impl Core {
         sink: &mut S,
     ) -> Result<(), InjectError> {
         if self.cbr.is_none() {
-            // VBR: everything due goes before the input packet; PSI as
-            // TB_sys allows (D-ISO13818-21).
+            // VBR: the rest of the previous video PES first
+            // (st1402-time.md D-13), then everything due goes before the
+            // input packet; PSI as TB_sys allows (D-ISO13818-21).
+            if self.video_touched && !self.video.before.is_empty() {
+                let v = std::mem::take(&mut self.video.before);
+                for q in &v {
+                    self.inserted_in_interval += 1;
+                    self.write_video(q, sink);
+                }
+                self.video.before = v;
+                self.video.before.clear();
+            }
             // An input that sends PSI faster than TB_sys drains overflows
             // it anyway; the queue never grows past a bound.
             while !self.psi_q.is_empty()
@@ -1641,7 +2169,20 @@ impl Core {
                 Slot::Replace(q) => self.write_input(&q, sink),
                 Slot::Merged => self.merged_input(p, sink)?,
             }
+            if self.video_touched && !self.video.after.is_empty() {
+                // The PES ended with this packet (R-ST1402TIME-14).
+                let v = std::mem::take(&mut self.video.after);
+                for q in &v {
+                    self.inserted_in_interval += 1;
+                    self.write_video(q, sink);
+                }
+                self.video.after = v;
+                self.video.after.clear();
+            }
             return Ok(());
+        }
+        if self.video_touched && (!self.video.before.is_empty() || !self.video.after.is_empty()) {
+            return Err(self.video_cbr_error());
         }
         // CBR: one packet out for every packet in. PSI and diverted input
         // packets that cannot find slots are not dropped: that is a failure
@@ -1796,6 +2337,7 @@ impl Core {
                 m.fifo.clear();
             }
         }
+        self.rec.finish(sink);
         Ok(())
     }
 }

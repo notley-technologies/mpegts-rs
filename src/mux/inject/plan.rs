@@ -137,7 +137,8 @@ fn build(
     let t = i.tables;
     let prev = i.previous.filter(|p| p.target.program == number);
     let pcr_pid = pmt.pcr();
-    let video_pid = pmt.video().map(|s| s.pid);
+    let video = pmt.video();
+    let video_pid = video.map(|s| s.pid);
     // Elementary PIDs are 0x0010 to 0x1FFE (R-ISO13818-015); an entry
     // elsewhere is not a stream the injector can remove or join.
     let valid = |pid: u16| (0x0010..NULL_PID).contains(&pid);
@@ -354,6 +355,8 @@ fn build(
             pmt_pid,
             pcr_pid,
             video_pid,
+            video_stream_type: video.map(|s| s.stream_type),
+            video_codec: video.and_then(|s| crate::nal::VideoCodec::from_codec(s.codec)),
             klv_pid,
             service_id,
             carriage: cfg.carriage,

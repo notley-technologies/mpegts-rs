@@ -783,17 +783,31 @@ fn keep_merges_into_the_existing_sync_stream() {
         theirs, input_aus,
         "input access unit bytes are never changed"
     );
-    // One sequence_number counter for the whole PID, CC continuous
-    // (checked by the checker and the demuxer).
-    let mut seqs = Vec::new();
-    for p in r
-        .out
-        .chunks(188)
-        .filter(|p| pid_of(p) == 0x101 && p[1] & 0x40 != 0)
-    {
-        let h = PacketHeader::parse(p.try_into().unwrap()).unwrap();
-        seqs.push(h.payload(p.try_into().unwrap())[15]);
-    }
+    // CC continuous (checked by the checker and the demuxer). Cells are
+    // numbered per access unit (DECISIONS X-8): ours 0, the input's as
+    // they were.
+    let cells = |out: &[u8]| -> Vec<(u8, u8)> {
+        out.chunks(188)
+            .filter(|p| pid_of(p) == 0x101 && p[1] & 0x40 != 0)
+            .map(|p| {
+                let h = PacketHeader::parse(p.try_into().unwrap()).unwrap();
+                let pes = h.payload(p.try_into().unwrap());
+                (pes[14], pes[15])
+            })
+            .collect()
+    };
+    let input_seqs: Vec<u8> = cells(&made.ts).iter().map(|c| c.1).collect();
+    let out = cells(&r.out);
+    assert!(out.iter().filter(|c| c.0 == 1).all(|c| c.1 == 0), "{out:?}");
+    let kept: Vec<u8> = out.iter().filter(|c| c.0 == 0).map(|c| c.1).collect();
+    assert_eq!(kept, input_seqs, "the input's cells keep their numbers");
+    // Numbered per stream, the input's cells are renumbered so that one
+    // counter runs over both services.
+    let mut per_stream = cfg.clone();
+    per_stream.sync.cell_numbering = mpegts::mux::CellNumbering::PerStream;
+    let r2 = inject(per_stream.clone(), &made.ts, Feed::Reordered);
+    checked(&r2, &per_stream);
+    let seqs: Vec<u8> = cells(&r2.out).iter().map(|c| c.1).collect();
     assert!(
         seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)),
         "{seqs:?}"

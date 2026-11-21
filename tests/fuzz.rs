@@ -160,6 +160,29 @@ fn fuzz_capi() {
     fuzz("capi", harness::capi, random_seeds(&[64, 512, 2048]), 400);
 }
 
+/// Access units of every synthetic codec, with SEI user data, B-frames
+/// and a prefix NAL unit.
+fn nal_seeds() -> Vec<Vec<u8>> {
+    use harness::es::{access_unit, EsConfig, Video};
+    let mut seeds = random_seeds(&[16, 256]);
+    for video in [Video::H264, Video::H265, Video::Mpeg2] {
+        let mut cfg = EsConfig::new(video);
+        cfg.other = true;
+        cfg.misp = true;
+        cfg.prefix_nal = video == Video::H264;
+        cfg.slice_bytes = 40;
+        for n in 0..3 {
+            seeds.push(access_unit(&cfg, n, true, None));
+        }
+    }
+    seeds
+}
+
+#[test]
+fn fuzz_nal() {
+    fuzz("nal", harness::nal, nal_seeds(), 600);
+}
+
 #[cfg(feature = "mux")]
 #[test]
 fn fuzz_mux() {
@@ -177,6 +200,17 @@ fn inject_seeds() -> Vec<Vec<u8>> {
     for (config, style, stream) in [(0x18u8, 1u8, 0x00u8), (0x19, 1, 0x04), (0x00, 0, 0x14), (0x1A, 1, 0x10), (0x08, 1, 0x2C)] {
         let mut s = vec![config, 0xFF, style, 1, 2, 3, 4, 5, 6, 7, 8, stream, 30];
         s.extend_from_slice(&[0; 12]);
+        seeds.push(s);
+    }
+    // Synthetic H.264, H.265 and MPEG-2 video with SEI (stream flag 0x80
+    // and its codec byte after the first DTS and edit count), then the
+    // video options byte: scan or write, extrapolated clock, M2TS.
+    for (config, style, codec, video) in [(0x18u8, 1u8, 0x0Cu8, 0x02u8), (0x08, 1, 0x8D, 0x0A), (0x18, 0, 0x5E, 0x05), (0x00, 1, 0x84, 0x0E)] {
+        let mut s = vec![config, 0xFF, style, 1, 2, 3, 4, 5, 6, 7, 8, 0x84, 20];
+        s.extend_from_slice(&[0; 8]); // first DTS
+        s.push(codec);
+        s.push(0); // no byte edits
+        s.push(video);
         seeds.push(s);
     }
     seeds

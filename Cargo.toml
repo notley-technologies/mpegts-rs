@@ -58,6 +58,10 @@ required-features = ["mux"]
 name = "inject"
 required-features = ["mux"]
 
+[[test]]
+name = "video_sei"
+required-features = ["mux"]
+
 [[example]]
 name = "json"
 required-features = ["serde"]

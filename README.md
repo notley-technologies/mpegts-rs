@@ -150,7 +150,7 @@ cargo run --features mux --example mux -- out.ts --frames 300
 ffprobe -show_streams -show_packets out.ts
 ```
 
-On the read side, without any feature, `PacketHeader::parse` and `PesHeader::parse` decode single packets and PES headers, and `PcrTimeline` gives every packet its time on the program clock (interpolated between PCRs, continuous across clock jumps), which pass-through tools need to pace or insert packets.
+On the read side, without any feature, `PacketHeader::parse` and `PesHeader::parse` decode single packets and PES headers, `PcrTimeline` gives every packet its time on the program clock (interpolated between PCRs, or extrapolated without holding anything; continuous across clock jumps), which pass-through tools need to pace or insert packets, and `mpegts::nal` reads H.264, H.265 and MPEG-2 video NAL units, SEI messages and user data.
 
 ## Injecting KLV
 
@@ -158,7 +158,7 @@ On the read side, without any feature, `PacketHeader::parse` and `PesHeader::par
 
 - PID 0: the input's own PAT sections, resent byte for byte with the injector's continuity counter;
 - the target program's PMT PID: the PMT rewritten with the KLV entry, its version one above the input's, a new CRC; other sections there are copied;
-- the KLV PID: the new stream, or, when the program already has synchronous KLV and `ExistingKlv::Keep` applies, the existing stream joined as a new metadata service (its continuity counters and cell sequence numbers renumbered, its access unit bytes untouched). `ExistingKlv::Replace` removes the program's KLV instead (a PCR it carries is kept); `ExistingKlv::Fail` refuses.
+- the KLV PID: the new stream, or, when the program already has synchronous KLV and `ExistingKlv::Keep` applies, the existing stream joined as a new metadata service (its continuity counters renumbered, its access unit bytes and cell headers untouched; cells are numbered from 0 in each access unit, DECISIONS X-8, or per stream with `CellNumbering::PerStream`, which renumbers the joined stream's cells). `ExistingKlv::Replace` removes the program's KLV instead (a PCR it carries is kept); `ExistingKlv::Fail` refuses.
 
 PAT and PMT copies are added so neither is ever more than `psi_interval_ms` (default 100) apart. Synchronous units are queued by PTS and each goes out at most 990 ms and at least 1 ms before its PTS (the T-STD limit is 1 s), right before the video frame it describes; units that can no longer make it are dropped and counted. Packets are timed on the program clock by PCR interpolation. In `RateMode::Cbr` the output has exactly as many packets as the input: inserted packets replace null packets and the packets the injector consumes, no packet (so no PCR) moves, and a lack of room fails loudly (`OnOverflow::Fail`) or drops units (`OnOverflow::DropOldest`), never silently becoming VBR.
 
@@ -189,6 +189,37 @@ println!("{} units, {} dropped late", stats.units_inserted, stats.dropped_late);
 - Memory is bounded by the configuration, and the steady state does not allocate. Release-mode throughput on a synthetic 11 Mbit/s stream is about 3 GB/s with `push` and 5 GB/s with `push_packet` (`cargo test --release --features mux --test inject -- --ignored throughput --nocapture`).
 - In C: `mpegts_injector_*` in `include/mpegts.h`, with output and frame callbacks.
 
+### Live input: the extrapolating clock
+
+`push` times packets on the program clock. By default (`ClockMode::Interpolate`) it holds each PCR interval until its closing PCR arrives and spreads the packets between the two PCRs, which is exact but adds up to one PCR interval of latency. `InjectConfig::clock = ClockMode::Extrapolate` holds nothing: each packet's clock is extrapolated from the last PCR at the transport rate measured over the previous PCR interval, corrected at every PCR and never going backwards within a time base. With video SEI off, every whole packet pushed is written before `push` returns (once the target program is known), which is what a live injector needs. `PcrTimeline::with_mode` offers the same choice to other pass-through tools.
+
+### SEI user data in the video (MISB ST 0604 timestamps)
+
+`InjectConfig::video_sei` reads, and optionally writes, user data in the target's video, for example the MISB ST 0604 timestamps that anchor KLV time to the frames. The injector stays MISB-agnostic: it reads and writes SEI `user_data_unregistered` messages; the caller decides what goes in them.
+
+- `VideoSei::Off` (default): video bytes are never parsed or changed.
+- `VideoSei::Scan`: the frame callback runs once the access unit's prefix (everything before its first VCL NAL unit, or first slice in MPEG-2) has been read, and `Units::user_data()` lists its messages (16-byte identifier, payload without emulation prevention, position) for H.264, H.265 and MPEG-2 video. The output is unchanged.
+- `VideoSei::Write` (H.264 stream_type 0x1B and H.265 0x24): `Units::write_user_data(uuid, payload, replace)` writes one message per access unit. A message whose identifier is `uuid` or in `replace` is rewritten in place (same NAL unit and position, payloadSize recoded, emulation prevention run again); otherwise a new SEI NAL unit with a 4-byte start code goes right before the first VCL NAL unit (after the access unit delimiter, parameter sets and existing SEI; before an H.264 prefix NAL unit; H.265 TemporalId copied from the slice), per `docs/standards/st1402-time.md` D-12.
+
+```rust
+use mpegts::mux::{Frame, InjectConfig, Injector, Units, VideoSei};
+
+const MISP: [u8; 16] = *b"MISPmicrosectime"; // H.264 ST 0604 identifier
+let mut injector = Injector::new(InjectConfig::default().with_video_sei(VideoSei::Write))?;
+let mut on_frame = |frame: &Frame, units: &mut Units<'_>| {
+    // An ST 0604 message already in the access unit anchors MISP time...
+    let anchor = units.user_data().iter().find(|m| m.uuid == MISP).map(|m| m.payload.clone());
+    // ...or this access unit gets one (status byte and modified time stamp).
+    let _ = units.write_user_data(MISP, &st0604_for(frame.pts, anchor), &[MISP]);
+};
+```
+
+The video PES is then re-packetized: the new bytes fill the adaptation field stuffing of the PES's packets, `PES_packet_length` is updated when it is not 0, the video PID's continuity counters are renumbered, and PTS, DTS and every PCR stay as they were. In `RateMode::Vbr` bytes that stuffing cannot absorb go into added video packets at the end of the PES; in `RateMode::Cbr` each video PES is held whole and null packets in it carry them, so the packet count stays the input's, and a lack of room fails (`OnOverflow::Fail`) or leaves the access unit unchanged with a warning (`OnOverflow::DropOldest`). Every other PID passes through byte for byte. `mpegts::nal` (no feature needed) has the reading side on its own: Annex B NAL units, emulation prevention, SEI messages, user data, and builders for an SEI NAL unit.
+
+### M2TS
+
+`InjectConfig::record = RecordFormat::M2ts` takes and writes 192-byte M2TS records (a 4-byte TP_extra_header with copy_permission_indicator and arrival_time_stamp, then the packet): `push` frames bytes at 192, `push_record` takes one record with its clock, and the output goes to `PacketSink::record` (a `Vec<u8>` stores whole records; closures can use `RecordFn`). Input records keep their header; a packet the injector adds gets the copy_permission_indicator of the next input record and an arrival_time_stamp interpolated between its neighbours (modulo 2^30); in CBR every record is an input record.
+
 ## C API
 
 The header is [include/mpegts.h](include/mpegts.h). Its opening comment states the rules every function follows: status codes, NULL checks, structs that carry their size so fields can be added compatibly, thread use, pointer lifetimes, output buffers and callbacks. No panic crosses into C. [examples/c/klv_dump.c](examples/c/klv_dump.c) shows the usual flow. The write side is there too (`mpegts_program_tables_*`, `mpegts_pes_writer_*`), writing packets into the caller's buffer, and the injector (`mpegts_injector_*`), writing through a callback; `make` builds the library with them.
@@ -218,7 +249,7 @@ target_link_libraries(app PRIVATE mpegts::mpegts)   # or mpegts::mpegts_static
 
 ## Supported input
 
-- 188-byte TS, 192-byte M2TS and 204-byte (RS parity) packets, auto-detected
+- 188-byte TS, 192-byte M2TS and 204-byte (RS parity) packets, auto-detected (the injector takes 188-byte packets or, configured for it, 192-byte M2TS records)
 - Resynchronisation after corrupt or missing bytes
 - Identification by stream type, by DVB/registration/metadata descriptors, and by payload inspection when a PMT is vague (e.g. undeclared KLV)
 - KLV per MISB ST 1402: sync (stream type 0x15 + `KLVA` metadata descriptor) and async (0x06 + `KLVA` registration, SMPTE RP 217)
@@ -264,21 +295,24 @@ The C tests compile programs against the header and the shared library, check th
 The write side and the injector are also checked against FFmpeg with the KLV patch series (`ffmpeg-klv-fix`) and against TSDuck when you point the tests at them (a wrong path fails the test):
 
 ```bash
-MPEGTS_FFPROBE=/path/to/ffprobe MPEGTS_FFMPEG=/path/to/ffmpeg cargo test --features mux --test mux --test inject
-MPEGTS_TSDUCK=/directory/with/tsp/and/tsanalyze cargo test --features mux --test inject
+MPEGTS_FFPROBE=/path/to/ffprobe MPEGTS_FFMPEG=/path/to/ffmpeg cargo test --features mux --test mux --test inject --test video_sei
+MPEGTS_TSDUCK=/directory/with/tsp/and/tsanalyze cargo test --features mux --test inject --test video_sei
 ```
+
+`tests/video_sei.rs` builds H.264, H.265 and MPEG-2 streams with valid parameter sets and slice headers (`tests/harness/es.rs`); FFmpeg's `trace_headers` bitstream filter must show each written SEI message with its identifier and payload, in the right place.
 
 The injector tests run every output through a conformance checker ([tests/harness/check.rs](tests/harness/check.rs)): continuity counters, PSI repetition, the arrival window of every synchronous KLV unit by PCR interpolation, PTS order, PES and cell rules for both carriages, the PMT descriptors, and no PCR on the KLV PID.
 
 ## Fuzzing
 
-Five harnesses in [tests/harness](tests/harness/mod.rs) accept any bytes. They check that nothing panics, results do not depend on how input is split into pushes, every buffer stays within its `Config` limit, and the C API returns only documented status codes:
+Six harnesses in [tests/harness](tests/harness/mod.rs) accept any bytes. They check that nothing panics, results do not depend on how input is split into pushes, every buffer stays within its `Config` limit, and the C API returns only documented status codes:
 
 - `demux`: raw bytes.
 - `stream`: the bytes drive a generator of tables, PES packets, PCRs and corruption, so mutations explore stream structure.
 - `capi`: sequences of C API calls, including invalid arguments and mismatched struct sizes (with `mux`, the write side's calls too).
 - `mux`: random tables, streams, units, sink sizes and counter changes for the write primitives; everything accepted must obey the packet rules and read back unchanged through the demuxer.
-- `inject`: the injector on generated and mutated synthetic streams with random configurations and insert schedules; it must stay within its limits, return only documented errors, and pass every packet it does not own through unchanged and in order.
+- `inject`: the injector on generated and mutated synthetic streams (including H.264, H.265 and MPEG-2 video with SEI, and M2TS records) with random configurations, insert schedules and SEI writes; it must stay within its limits, return only documented errors, and pass every packet it does not own through unchanged and in order.
+- `nal`: video elementary stream bytes for `mpegts::nal`; positions stay within the input, emulation prevention and SEI rebuilding round-trip.
 
 `cargo test` runs them over a few thousand mutated inputs on the stable toolchain. For longer runs, or coverage-guided fuzzing with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz):
 

@@ -1,7 +1,7 @@
 //! Stream descriptions, and the KLV carriage presets of MISB ST 1402.2 and
 //! SMPTE RP 217.
 
-use super::{Carriage, MuxError};
+use super::{Carriage, CellNumbering, MuxError};
 use crate::Descriptor;
 
 /// The SMPTE-registered format identifier of KLV, "KLVA" (0x4B4C5641;
@@ -113,6 +113,9 @@ pub struct SyncKlvOptions {
     pub buffer_size: u32,
     /// metadata_output_leak_rate, 22 bits. Default 0 (R-ST1402TIME-31).
     pub output_leak_rate: u32,
+    /// How cell sequence numbers are counted. Default
+    /// [`CellNumbering::PerAccessUnit`] (DECISIONS X-8).
+    pub cell_numbering: CellNumbering,
 }
 
 impl Default for SyncKlvOptions {
@@ -123,6 +126,7 @@ impl Default for SyncKlvOptions {
             input_leak_rate: MAX_22_BITS,
             buffer_size: 0x400,
             output_leak_rate: 0,
+            cell_numbering: CellNumbering::PerAccessUnit,
         }
     }
 }

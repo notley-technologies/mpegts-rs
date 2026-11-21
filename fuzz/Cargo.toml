@@ -62,3 +62,10 @@ required-features = ["mux"]
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "nal"
+path = "fuzz_targets/nal.rs"
+test = false
+doc = false
+bench = false

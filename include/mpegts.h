@@ -28,8 +28,8 @@
  *    (no continuity counter, sequence number or version moves). `out` may
  *    be NULL only when capacity is 0.
  *  - Functions that produce a stream of unknown length (the injector) hand
- *    it to a caller callback instead, whole 188-byte packets at a time,
- *    before they return. Callbacks must return normally (no longjmp) and
+ *    it to a caller callback instead, whole 188-byte packets (or 192-byte
+ *    M2TS records, when configured) at a time, before they return. Callbacks must return normally (no longjmp) and
  *    must not call back into the object that called them, except through
  *    the handle they are given.
  *
@@ -546,9 +546,19 @@ mpegts_status mpegts_pes_writer_continuity_counter(const mpegts_pes_writer *writ
 mpegts_status mpegts_pes_writer_set_continuity_counter(mpegts_pes_writer *writer, uint8_t cc);
 /* Set discontinuity_indicator in the next packet. */
 mpegts_status mpegts_pes_writer_mark_discontinuity(mpegts_pes_writer *writer);
-/* sequence_number of the next metadata access unit cell. */
+/* sequence_number of the next access unit's first cell: 0 when cells are
+ * numbered per access unit (the default), the stream's counter when numbered
+ * per stream. Setting it sets the per-stream counter. */
 mpegts_status mpegts_pes_writer_sequence_number(const mpegts_pes_writer *writer, uint8_t *sequence);
 mpegts_status mpegts_pes_writer_set_sequence_number(mpegts_pes_writer *writer, uint8_t sequence);
+/* How metadata cells are numbered (ISO/IEC 13818-1 2.12.4.1, DECISIONS X-8):
+ * MPEGTS_CELLS_PER_AU (default) starts each access unit at 0 and counts its
+ * fragments on (a complete access unit is cell 0 of its PES packet);
+ * MPEGTS_CELLS_PER_STREAM counts every cell of the PID modulo 256.
+ * MPEGTS_ERR_INVALID for another value. */
+#define MPEGTS_CELLS_PER_AU 0
+#define MPEGTS_CELLS_PER_STREAM 1
+mpegts_status mpegts_pes_writer_set_cell_numbering(mpegts_pes_writer *writer, uint32_t numbering);
 
 /* A null packet (PID 0x1FFF) into packet[0..188). */
 mpegts_status mpegts_null_packet(uint8_t *packet);
@@ -567,7 +577,34 @@ mpegts_status mpegts_null_packet(uint8_t *packet);
  * many packets as the input: inserted packets replace null packets and the
  * packets the injector consumes, and no packet moves. Input is held until
  * the target's PMT is known (at most max_held_packets packets) and, for
- * mpegts_injector_push, until each PCR interval is complete. */
+ * mpegts_injector_push with MPEGTS_CLOCK_INTERPOLATE, until each PCR
+ * interval is complete; MPEGTS_CLOCK_EXTRAPOLATE holds nothing for the
+ * clock (live input).
+ *
+ * Video user data (video_sei): with MPEGTS_VIDEO_SEI_SCAN the frame
+ * callback runs once the access unit's prefix (everything before its first
+ * VCL NAL unit, or first slice in MPEG-2) has been read, and
+ * mpegts_inject_units_user_data gives its SEI user_data_unregistered (or
+ * MPEG-2 user_data) messages, for example MISB ST 0604 timestamps; the
+ * output is unchanged. MPEGTS_VIDEO_SEI_WRITE (H.264 stream_type 0x1B and
+ * H.265 0x24 only; other video fails when the target is chosen) also lets
+ * the callback write one message per access unit
+ * (mpegts_inject_units_write_user_data): an existing message with a
+ * matching identifier is rewritten in place, else a new SEI NAL unit goes
+ * right before the first VCL NAL unit. The video PES is re-packetized
+ * (PES_packet_length, continuity counters; PTS, DTS and PCRs unchanged):
+ * VBR adds video packets when the stuffing of the PES's packets is not
+ * enough, CBR uses null packets of the PES (held whole) and fails
+ * (MPEGTS_RATE_CBR_FAIL) or leaves the access unit unchanged
+ * (MPEGTS_RATE_CBR_DROP_OLDEST, MPEGTS_WARN_USER_DATA_SKIPPED) without
+ * room.
+ *
+ * M2TS (record MPEGTS_RECORD_M2TS): input and output are 192-byte records
+ * (4-byte TP_extra_header: copy_permission_indicator, arrival_time_stamp;
+ * then the packet). Input records keep their header; an inserted packet
+ * gets the next input record's copy_permission_indicator and a stamp
+ * interpolated between its neighbours (mod 2^30); in CBR every record is
+ * an input record. */
 
 typedef struct mpegts_injector mpegts_injector;           /* opaque */
 typedef struct mpegts_inject_units mpegts_inject_units;   /* opaque, frame callback only */
@@ -584,11 +621,23 @@ typedef struct mpegts_inject_units mpegts_inject_units;   /* opaque, frame callb
 #define MPEGTS_RATE_VBR 0             /* inserted packets are added */
 #define MPEGTS_RATE_CBR_FAIL 1        /* same packet count; no room in time: MPEGTS_ERR_STREAM */
 #define MPEGTS_RATE_CBR_DROP_OLDEST 2 /* same packet count; no room: drop units, count them */
+/* mpegts_inject_config.video_sei */
+#define MPEGTS_VIDEO_SEI_OFF 0   /* video bytes are never read or changed */
+#define MPEGTS_VIDEO_SEI_SCAN 1  /* read each access unit's user data (H.264, H.265, MPEG-2) */
+#define MPEGTS_VIDEO_SEI_WRITE 2 /* read, and write from the frame callback (H.264, H.265) */
+/* mpegts_inject_config.clock: how mpegts_injector_push times packets */
+#define MPEGTS_CLOCK_INTERPOLATE 0 /* hold each PCR interval, interpolate (exact) */
+#define MPEGTS_CLOCK_EXTRAPOLATE 1 /* hold nothing, extrapolate from the last PCR (live) */
+/* mpegts_inject_config.record: input and output format */
+#define MPEGTS_RECORD_TS 0   /* 188-byte packets */
+#define MPEGTS_RECORD_M2TS 1 /* 192-byte M2TS records */
 /* mpegts_inject_config.flags */
 #define MPEGTS_INJECT_HAS_SERVICE_ID 0x01    /* use service_id (else the lowest free one) */
 #define MPEGTS_INJECT_HAS_PID 0x02           /* use pid (else a free one) */
 #define MPEGTS_INJECT_NO_FRAME_ALIGN 0x04    /* send sync units as their window opens */
 #define MPEGTS_INJECT_SYNC_REGISTRATION 0x08 /* also the "KLVA" registration_descriptor */
+#define MPEGTS_INJECT_CELLS_PER_STREAM 0x10  /* number cells per stream, not per AU (X-8); an
+                                              * existing sync stream joined is renumbered */
 
 /* Settings. Fill with mpegts_inject_config_default, then change fields. */
 typedef struct mpegts_inject_config {
@@ -611,6 +660,10 @@ typedef struct mpegts_inject_config {
     uint64_t max_queued_units; /* default 4096 */
     uint64_t max_queued_bytes; /* default 8 MiB */
     uint64_t max_held_packets; /* default 50,000 */
+    uint32_t video_sei;            /* MPEGTS_VIDEO_SEI_*; default OFF */
+    uint32_t clock;                /* MPEGTS_CLOCK_*; default INTERPOLATE */
+    uint32_t record;               /* MPEGTS_RECORD_*; default TS */
+    uint32_t video_sei_max_prefix; /* most prefix bytes read per access unit; 65536, at least 16 */
 } mpegts_inject_config;
 
 /* mpegts_inject_unit.flags */
@@ -630,6 +683,8 @@ typedef struct mpegts_inject_unit {
 #define MPEGTS_FRAME_HAS_CLOCK 0x02
 #define MPEGTS_FRAME_RANDOM_ACCESS 0x04 /* random_access_indicator of its first packet */
 #define MPEGTS_FRAME_DISCONTINUITY 0x08 /* first frame after a time base discontinuity */
+#define MPEGTS_FRAME_SCANNED 0x10         /* the access unit's prefix was read (video_sei) */
+#define MPEGTS_FRAME_PREFIX_COMPLETE 0x20 /* ... up to its first VCL NAL unit: a write can go in */
 
 /* A video frame of the target, about to be written. */
 typedef struct mpegts_inject_frame {
@@ -641,6 +696,9 @@ typedef struct mpegts_inject_frame {
     uint64_t pts;   /* 90 kHz */
     uint64_t dts;   /* with HAS_DTS */
     uint64_t clock; /* program clock, 27 MHz, with HAS_CLOCK */
+    uint32_t video_codec;     /* with SCANNED: MPEGTS_CODEC_H264, _H265 or _MPEG2_VIDEO */
+    uint32_t user_data_count; /* user data messages (mpegts_inject_units_user_data) */
+    uint64_t prefix_bytes;    /* with SCANNED: elementary stream bytes of the prefix read */
 } mpegts_inject_frame;
 
 /* mpegts_inject_target.flags */
@@ -660,6 +718,9 @@ typedef struct mpegts_inject_target {
     uint8_t carriage;        /* MPEGTS_INJECT_SYNC or _ASYNC */
     uint32_t stripped_count; /* input KLV PIDs removed (REPLACE) */
     uint16_t stripped[8];    /* the first eight of them */
+    uint32_t video_codec;      /* MPEGTS_CODEC_* of video_pid when its user data can be read, else 0 */
+    uint8_t video_stream_type; /* stream_type of video_pid (when video_pid is not 0x1FFF) */
+    uint8_t reserved3[3];
 } mpegts_inject_target;
 
 /* Counters; see the Rust documentation of InjectStats for each. */
@@ -694,6 +755,13 @@ typedef struct mpegts_inject_stats {
     uint64_t free_bitrate;         /* bit/s: CBR headroom */
     int64_t added_bitrate;         /* bit/s */
     uint64_t events_dropped;
+    uint64_t frames_scanned;      /* access unit prefixes read (video_sei) */
+    uint64_t user_data_found;     /* user data messages in them */
+    uint64_t user_data_inserted;  /* SEI NAL units inserted */
+    uint64_t user_data_rewritten; /* messages rewritten in place */
+    uint64_t user_data_skipped;   /* writes not applied (MPEGTS_WARN_USER_DATA_SKIPPED) */
+    uint64_t video_packets_added; /* VBR: video packets added for written bytes */
+    uint64_t video_slots_filled;  /* CBR: null packets that became video packets */
 } mpegts_inject_stats;
 
 /* mpegts_inject_event.kind */
@@ -715,6 +783,11 @@ typedef struct mpegts_inject_stats {
 #define MPEGTS_WARN_SERVICE_ID_CHANGED 2  /* value: new id, bytes: old id */
 #define MPEGTS_WARN_SERVICE_ID_IN_INPUT 3 /* value: the id */
 #define MPEGTS_WARN_LATE_UNIT 4           /* value: PTS (CBR, DROP_OLDEST) */
+#define MPEGTS_WARN_USER_DATA_SKIPPED 5   /* value: PTS of the access unit, bytes: MPEGTS_SKIP_* */
+/* Why a user data write was not applied (the access unit went out unchanged) */
+#define MPEGTS_SKIP_INCOMPLETE 1   /* the prefix was not read up to the first VCL NAL unit */
+#define MPEGTS_SKIP_PES_TOO_LONG 2 /* PES_packet_length would exceed 65535 */
+#define MPEGTS_SKIP_NO_ROOM 3      /* no room in CBR (MPEGTS_RATE_CBR_DROP_OLDEST) */
 
 typedef struct mpegts_inject_event {
     uint32_t struct_size;
@@ -725,11 +798,13 @@ typedef struct mpegts_inject_event {
     uint64_t bytes;
 } mpegts_inject_event;
 
-/* Output: whole packets, len a multiple of 188, valid during the call. */
+/* Output: whole packets, len a multiple of 188 (of 192 with
+ * MPEGTS_RECORD_M2TS), valid during the call. */
 typedef void (*mpegts_packets_fn)(void *user, const uint8_t *packets, size_t len);
 /* Called right before the first packet of each video frame of the target is
- * written. Units inserted through `units` (valid during the call only) can
- * go out immediately before that frame. */
+ * written (with video_sei, once its access unit prefix has been read).
+ * Units inserted through `units` (valid during the call only) can go out
+ * immediately before that frame. */
 typedef void (*mpegts_frame_fn)(void *user, const mpegts_inject_frame *frame, mpegts_inject_units *units);
 
 mpegts_status mpegts_inject_config_default(mpegts_inject_config *config);
@@ -747,8 +822,14 @@ mpegts_status mpegts_injector_push(mpegts_injector *injector, const uint8_t *dat
                                    mpegts_packets_fn sink, void *sink_user, mpegts_frame_fn on_frame,
                                    void *frame_user);
 /* Push one 188-byte packet with its program clock (27 MHz; NULL: none yet),
- * for callers that time the input themselves. Do not mix with _push. */
+ * for callers that time the input themselves. Do not mix with _push.
+ * MPEGTS_ERR_INVALID with MPEGTS_RECORD_M2TS (use _push_record). */
 mpegts_status mpegts_injector_push_packet(mpegts_injector *injector, const uint8_t *packet, const uint64_t *clock,
+                                          mpegts_packets_fn sink, void *sink_user, mpegts_frame_fn on_frame,
+                                          void *frame_user);
+/* The same for one 192-byte M2TS record (MPEGTS_RECORD_M2TS only, else
+ * MPEGTS_ERR_INVALID); its TP_extra_header goes out with the packet. */
+mpegts_status mpegts_injector_push_record(mpegts_injector *injector, const uint8_t *record, const uint64_t *clock,
                                           mpegts_packets_fn sink, void *sink_user, mpegts_frame_fn on_frame,
                                           void *frame_user);
 /* Queue a unit. MPEGTS_ERR_FULL: the queue is full, try again after more
@@ -760,6 +841,27 @@ mpegts_status mpegts_inject_units_insert(mpegts_inject_units *units, const mpegt
 /* Program clock at the frame (MPEGTS_EMPTY before the first PCR). */
 mpegts_status mpegts_inject_units_clock(const mpegts_inject_units *units, uint64_t *clock);
 mpegts_status mpegts_inject_units_target(const mpegts_inject_units *units, mpegts_inject_target *target);
+/* User data message `index` (0 to frame->user_data_count - 1) of the access
+ * unit: its 16-byte identifier into uuid[0..16), its payload (the bytes
+ * after the identifier, emulation prevention removed) in *data and *len,
+ * valid during the callback (*data is NULL when *len is 0).
+ * MPEGTS_ERR_RANGE past the last one. */
+mpegts_status mpegts_inject_units_user_data(const mpegts_inject_units *units, uint32_t index, uint8_t *uuid,
+                                            const uint8_t **data, uint64_t *len);
+/* Write one user_data_unregistered message, `uuid` (16 bytes) then `data`,
+ * into the access unit (MPEGTS_VIDEO_SEI_WRITE). When a message of the
+ * access unit has its identifier equal to `uuid` or among the replace_count
+ * 16-byte identifiers at `replace` (NULL when replace_count is 0), that
+ * message is rewritten in place; otherwise a new SEI NAL unit is inserted
+ * before the first VCL NAL unit. Applied when the callback returns (see
+ * mpegts_inject_stats and MPEGTS_WARN_USER_DATA_SKIPPED). MPEGTS_ERR_INVALID:
+ * not MPEGTS_VIDEO_SEI_WRITE, video that is not written, a second write in
+ * the access unit, more than 65,519 bytes, or a prefix not read up to the
+ * first VCL NAL unit (MPEGTS_FRAME_PREFIX_COMPLETE unset; counted as
+ * skipped). */
+mpegts_status mpegts_inject_units_write_user_data(mpegts_inject_units *units, const uint8_t *uuid,
+                                                  const uint8_t *data, size_t len, const uint8_t *replace,
+                                                  size_t replace_count);
 /* The input has ended: process the packets still held (frames among them
  * go to on_frame, which may be NULL) without ending the stream, so units
  * for the last frames can still be inserted before

@@ -5,6 +5,10 @@
  *                                one unit per video frame from the frame
  *                                callback, write OUT.ts and print what the
  *                                calls returned
+ *   inject_test IN.ts OUT.ts SEI_IN.ts SEI_OUT.ts
+ *                                also read and write SEI user data in the
+ *                                H.264 video of SEI_IN.ts (MPEGTS_VIDEO_SEI_WRITE),
+ *                                then inject it as M2TS records
  */
 #include "mpegts.h"
 
@@ -42,6 +46,10 @@ static void layout(void) {
     F(mpegts_inject_config, max_queued_units)
     F(mpegts_inject_config, max_queued_bytes)
     F(mpegts_inject_config, max_held_packets)
+    F(mpegts_inject_config, video_sei)
+    F(mpegts_inject_config, clock)
+    F(mpegts_inject_config, record)
+    F(mpegts_inject_config, video_sei_max_prefix)
     F(mpegts_inject_unit, struct_size)
     F(mpegts_inject_unit, flags)
     F(mpegts_inject_unit, pts)
@@ -55,6 +63,9 @@ static void layout(void) {
     F(mpegts_inject_frame, pts)
     F(mpegts_inject_frame, dts)
     F(mpegts_inject_frame, clock)
+    F(mpegts_inject_frame, video_codec)
+    F(mpegts_inject_frame, user_data_count)
+    F(mpegts_inject_frame, prefix_bytes)
     F(mpegts_inject_target, struct_size)
     F(mpegts_inject_target, flags)
     F(mpegts_inject_target, program)
@@ -66,6 +77,9 @@ static void layout(void) {
     F(mpegts_inject_target, carriage)
     F(mpegts_inject_target, stripped_count)
     F(mpegts_inject_target, stripped)
+    F(mpegts_inject_target, video_codec)
+    F(mpegts_inject_target, video_stream_type)
+    F(mpegts_inject_target, reserved3)
     F(mpegts_inject_stats, struct_size)
     F(mpegts_inject_stats, reserved)
     F(mpegts_inject_stats, packets_in)
@@ -74,6 +88,13 @@ static void layout(void) {
     F(mpegts_inject_stats, metadata_buffer_peak)
     F(mpegts_inject_stats, added_bitrate)
     F(mpegts_inject_stats, events_dropped)
+    F(mpegts_inject_stats, frames_scanned)
+    F(mpegts_inject_stats, user_data_found)
+    F(mpegts_inject_stats, user_data_inserted)
+    F(mpegts_inject_stats, user_data_rewritten)
+    F(mpegts_inject_stats, user_data_skipped)
+    F(mpegts_inject_stats, video_packets_added)
+    F(mpegts_inject_stats, video_slots_filled)
     F(mpegts_inject_event, struct_size)
     F(mpegts_inject_event, kind)
     F(mpegts_inject_event, code)
@@ -109,6 +130,26 @@ static void collect(void *user, const uint8_t *packets, size_t len) {
         }
     }
     memcpy(b->data + b->len, packets, len);
+    b->len += len;
+}
+
+static uint8_t *read_file(const char *path, size_t *len);
+
+/* M2TS output: whole 192-byte records. */
+static void collect_records(void *user, const uint8_t *records, size_t len) {
+    struct buffer *b = user;
+    if (len % 192 != 0) {
+        fprintf(stderr, "record sink got %lu bytes\n", (unsigned long)len);
+        exit(1);
+    }
+    if (b->len + len > b->cap) {
+        b->cap = (b->len + len) * 2;
+        b->data = realloc(b->data, b->cap);
+        if (!b->data) {
+            exit(1);
+        }
+    }
+    memcpy(b->data + b->len, records, len);
     b->len += len;
 }
 
@@ -150,6 +191,140 @@ static void on_frame(void *user, const mpegts_inject_frame *frame, mpegts_inject
     if (mpegts_inject_units_insert(units, &unit) == MPEGTS_OK) {
         f->inserted++;
     }
+}
+
+/* What the SEI frame callback saw. */
+struct sei_frames {
+    unsigned count, scanned, complete, h264, messages, misp, written, second, range;
+};
+
+static const uint8_t misp_uuid[16] = {'M', 'I', 'S', 'P', 'm', 'i', 'c', 'r', 'o', 's', 'e', 'c', 't', 'i', 'm', 'e'};
+
+/* Write an ST 0604-like message into every access unit, replacing the one
+ * there is. */
+static void on_sei_frame(void *user, const mpegts_inject_frame *frame, mpegts_inject_units *units) {
+    struct sei_frames *f = user;
+    uint8_t payload[12] = {0x9F, 0, 0, 0xFF, 0, 0, 0xFF, 0, 0, 0xFF, 0, 0};
+    uint8_t uuid[16];
+    const uint8_t *data = NULL;
+    uint64_t len = 0;
+    uint32_t i;
+    f->count++;
+    if (frame->flags & MPEGTS_FRAME_SCANNED) {
+        f->scanned++;
+    }
+    if (frame->flags & MPEGTS_FRAME_PREFIX_COMPLETE) {
+        f->complete++;
+    }
+    if (frame->video_codec == MPEGTS_CODEC_H264) {
+        f->h264++;
+    }
+    for (i = 0; i < frame->user_data_count; i++) {
+        if (mpegts_inject_units_user_data(units, i, uuid, &data, &len) == MPEGTS_OK) {
+            f->messages++;
+            if (memcmp(uuid, misp_uuid, 16) == 0 && len == 12 && data != NULL) {
+                f->misp++;
+            }
+        }
+    }
+    if (mpegts_inject_units_user_data(units, frame->user_data_count, uuid, &data, &len) == MPEGTS_ERR_RANGE) {
+        f->range++;
+    }
+    payload[11] = (uint8_t)f->count;
+    if (mpegts_inject_units_write_user_data(units, misp_uuid, payload, sizeof payload, misp_uuid, 1) ==
+        MPEGTS_OK) {
+        f->written++;
+    }
+    if (mpegts_inject_units_write_user_data(units, misp_uuid, payload, sizeof payload, NULL, 0) ==
+        MPEGTS_ERR_INVALID) {
+        f->second++;
+    }
+}
+
+static void sei_phase(const char *in_path, const char *out_path) {
+    mpegts_inject_config cfg;
+    mpegts_injector *injector = NULL;
+    mpegts_inject_stats stats;
+    mpegts_inject_target target;
+    struct buffer out = {NULL, 0, 0};
+    struct sei_frames f;
+    uint8_t *in, *m2ts;
+    uint8_t record[192];
+    size_t in_len, at, i, n;
+    FILE *file;
+
+    memset(&f, 0, sizeof f);
+    in = read_file(in_path, &in_len);
+    cfg.struct_size = sizeof cfg;
+    check("config_default", mpegts_inject_config_default(&cfg));
+    printf("SEI_DEFAULTS video_sei=%u clock=%u record=%u prefix=%u\n", cfg.video_sei, cfg.clock, cfg.record,
+           cfg.video_sei_max_prefix);
+    cfg.video_sei = MPEGTS_VIDEO_SEI_WRITE;
+    cfg.clock = MPEGTS_CLOCK_EXTRAPOLATE;
+    check("injector_new", mpegts_injector_new(&cfg, &injector));
+    memset(record, 0, sizeof record);
+    printf("RECORD_WRONG %d\n", mpegts_injector_push_record(injector, record, NULL, collect, &out, NULL, NULL));
+    for (at = 0; at < in_len; at += 1316) {
+        size_t len = in_len - at < 1316 ? in_len - at : 1316;
+        check("push", mpegts_injector_push(injector, in + at, len, collect, &out, on_sei_frame, &f));
+    }
+    stats.struct_size = sizeof stats;
+    check("finish", mpegts_injector_finish(injector, collect, &out, on_sei_frame, &f, &stats));
+    printf("SEI frames=%u scanned=%u complete=%u h264=%u messages=%u misp=%u written=%u second=%u range=%u\n",
+           f.count, f.scanned, f.complete, f.h264, f.messages, f.misp, f.written, f.second, f.range);
+    printf("SEI_STATS scanned=%lu found=%lu inserted=%lu rewritten=%lu skipped=%lu\n",
+           (unsigned long)stats.frames_scanned, (unsigned long)stats.user_data_found,
+           (unsigned long)stats.user_data_inserted, (unsigned long)stats.user_data_rewritten,
+           (unsigned long)stats.user_data_skipped);
+    target.struct_size = sizeof target;
+    check("target", mpegts_injector_target(injector, &target));
+    printf("SEI_TARGET codec=0x%x stream_type=0x%02x\n", target.video_codec, target.video_stream_type);
+    mpegts_injector_free(injector);
+    file = fopen(out_path, "wb");
+    if (!file || fwrite(out.data, 1, out.len, file) != out.len || fclose(file) != 0) {
+        perror(out_path);
+        exit(1);
+    }
+
+    /* The same input as M2TS records: their headers come back on the
+     * records that pass through. */
+    n = in_len / 188;
+    m2ts = malloc(n * 192);
+    if (!m2ts) {
+        exit(1);
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t h = 0x40000000u | (uint32_t)(i * 1000);
+        m2ts[i * 192] = (uint8_t)(h >> 24);
+        m2ts[i * 192 + 1] = (uint8_t)(h >> 16);
+        m2ts[i * 192 + 2] = (uint8_t)(h >> 8);
+        m2ts[i * 192 + 3] = (uint8_t)h;
+        memcpy(m2ts + i * 192 + 4, in + i * 188, 188);
+    }
+    check("config_default", mpegts_inject_config_default(&cfg));
+    cfg.record = MPEGTS_RECORD_M2TS;
+    check("injector_new", mpegts_injector_new(&cfg, &injector));
+    printf("PACKET_WRONG %d\n", mpegts_injector_push_packet(injector, in, NULL, collect_records, &out, NULL, NULL));
+    out.len = 0;
+    for (i = 0; i < n; i++) {
+        check("push_record",
+              mpegts_injector_push_record(injector, m2ts + i * 192, NULL, collect_records, &out, NULL, NULL));
+    }
+    check("finish", mpegts_injector_finish(injector, collect_records, &out, NULL, NULL, &stats));
+    /* Records that pass through keep their header: the first video one. */
+    for (i = 0; i < out.len; i += 192) {
+        if (((out.data[i + 5] & 0x1F) << 8 | out.data[i + 6]) == 0x100) {
+            printf("M2TS first_video_header=%02x%02x%02x%02x\n", out.data[i], out.data[i + 1], out.data[i + 2],
+                   out.data[i + 3]);
+            break;
+        }
+    }
+    printf("M2TS records=%lu in=%lu out=%lu\n", (unsigned long)(out.len / 192), (unsigned long)stats.packets_in,
+           (unsigned long)stats.packets_out);
+    mpegts_injector_free(injector);
+    free(m2ts);
+    free(out.data);
+    free(in);
 }
 
 static uint8_t *read_file(const char *path, size_t *len) {
@@ -254,6 +429,9 @@ int main(int argc, char **argv) {
     mpegts_injector_free(NULL);
     free(out.data);
     free(in);
+    if (argc >= 5) {
+        sei_phase(argv[3], argv[4]);
+    }
     printf("DONE\n");
     return 0;
 }
