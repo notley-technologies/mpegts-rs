@@ -838,6 +838,17 @@ pub unsafe extern "C" fn mpegts_inject_units_target(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn mpegts_injector_end_input(
+    injector: *mut mpegts_injector,
+    sink: mpegts_packets_fn,
+    sink_user: *mut c_void,
+    on_frame: mpegts_frame_fn,
+    frame_user: *mut c_void,
+) -> mpegts_status {
+    push_with(injector, sink, sink_user, on_frame, frame_user, |inj, s, cb| inj.end_input_with(s, cb))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn mpegts_injector_finish(
     injector: *mut mpegts_injector,
     sink: mpegts_packets_fn,

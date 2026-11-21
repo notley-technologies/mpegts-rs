@@ -116,7 +116,7 @@ fn exported_symbols_match_header() {
     let declared = header_functions();
     // 29 for reading, 37 for writing and 16 for injecting (built with the
     // `mux` feature).
-    assert_eq!(declared.len(), 82, "header functions: {declared:?}");
+    assert_eq!(declared.len(), 83, "header functions: {declared:?}");
     let missing: Vec<_> = declared.difference(&exported).collect();
     let extra: Vec<_> = exported.difference(&declared).collect();
     assert!(missing.is_empty(), "declared in the header but not exported: {missing:?}");

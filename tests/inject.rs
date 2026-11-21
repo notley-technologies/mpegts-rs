@@ -427,6 +427,51 @@ fn b_frames_get_metadata_in_presentation_order() {
     assert_eq!(r.stats.dropped_late, 0);
 }
 
+/// end_input_with processes what is still held without ending the stream,
+/// so the frames a reorder buffer keeps until the end still get their
+/// metadata before finish.
+#[test]
+fn end_input_lets_the_last_frames_get_metadata() {
+    let made = Synth {
+        b_frames: true,
+        frames: 120,
+        ..Synth::default()
+    }
+    .make();
+    let cfg = InjectConfig::default();
+    let mut inj = Injector::new(cfg.clone()).unwrap();
+    let mut out = Vec::new();
+    let mut reorder = FrameReorder::new(16);
+    let mut inserted = Vec::new();
+    let mut on_frame = |f: &Frame, u: &mut Units<'_>| {
+        reorder.push(*f);
+        while let Some(r) = reorder.pop() {
+            let data = unit_for(r.pts);
+            u.insert(InsertUnit::sync(r.pts, data.clone())).unwrap();
+            inserted.push((Some(r.pts), data));
+        }
+    };
+    for c in made.ts.chunks(1316) {
+        inj.push_with(c, &mut out, &mut on_frame).unwrap();
+    }
+    inj.end_input_with(&mut out, &mut on_frame).unwrap();
+    assert!(matches!(
+        inj.push(&made.ts[..188], &mut out),
+        Err(InjectError::Usage(_))
+    ));
+    for r in reorder.flush().collect::<Vec<_>>() {
+        let data = unit_for(r.pts);
+        inj.insert(InsertUnit::sync(r.pts, data.clone())).unwrap();
+        inserted.push((Some(r.pts), data));
+    }
+    let stats = inj.finish(&mut out).unwrap();
+    assert_eq!(inserted.len(), 120, "every frame, the last P frame too");
+    assert_eq!(stats.units_inserted, 120);
+    assert_eq!(stats.dropped_late, 0);
+    let klv_pid = inj.target().unwrap().klv_pid;
+    assert_eq!(read_back(&out, klv_pid), inserted);
+}
+
 #[test]
 fn pts_wrap_is_not_a_discontinuity() {
     // Starts 1.5 s before the 2^33 wrap.

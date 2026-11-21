@@ -826,6 +826,8 @@ pub struct Injector {
     framer: Framer,
     pipe: Pipeline,
     failed: Option<InjectError>,
+    /// [`Injector::end_input_with`] ran: no more input, units still go in.
+    input_ended: bool,
     finished: bool,
 }
 
@@ -842,6 +844,7 @@ impl Injector {
                 core: Core::new(cfg),
             },
             failed: None,
+            input_ended: false,
             finished: false,
         })
     }
@@ -859,6 +862,9 @@ impl Injector {
             return Err(InjectError::Usage("the injector is finished"));
         }
         if let Some(input) = input {
+            if self.input_ended {
+                return Err(InjectError::Usage("the input has ended"));
+            }
             match self.pipe.input {
                 Input::None => self.pipe.input = input,
                 i if i == input => {}
@@ -959,6 +965,43 @@ impl Injector {
         self.pipe.core.queue.insert(unit)
     }
 
+    /// The input has ended: process every packet still held (the bytes of
+    /// an unfinished packet, the input held for the tables, and the packets
+    /// after the last PCR, timed at the last known rate), with the frame
+    /// callback for the frames among them, but do not end the stream yet.
+    /// Units can still be inserted (for example the metadata of the last
+    /// frames, which a scheduler holding frames for presentation order only
+    /// releases now) before [`finish`](Self::finish) places what it can.
+    /// Pushing input afterwards is an error.
+    pub fn end_input_with<S, F>(&mut self, sink: &mut S, on_frame: &mut F) -> Result<(), InjectError>
+    where
+        S: PacketSink + ?Sized,
+        F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
+    {
+        self.usable(None)?;
+        if self.input_ended {
+            return Ok(());
+        }
+        let mut result = Ok(());
+        let pipe = &mut self.pipe;
+        if pipe.input == Input::Bytes {
+            self.framer
+                .finish(&mut |p| match pipe.bytes_packet(p, sink, on_frame) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        result = Err(e);
+                        false
+                    }
+                });
+            pipe.core.stats.bytes_skipped = self.framer.bytes_skipped;
+            pipe.core.stats.sync_losses = self.framer.sync_losses;
+        }
+        let r = result.and_then(|()| pipe.flush_held(sink, on_frame));
+        self.outcome(r)?;
+        self.input_ended = true;
+        Ok(())
+    }
+
     /// End of input: flush what is held, send what can still be placed,
     /// drop and count the rest. Returns the final counters. Frames still
     /// held (after the last PCR) go out without a frame callback; use
@@ -981,22 +1024,8 @@ impl Injector {
         S: PacketSink + ?Sized,
         F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
     {
-        self.usable(None)?;
-        let mut result = Ok(());
-        let pipe = &mut self.pipe;
-        if pipe.input == Input::Bytes {
-            self.framer
-                .finish(&mut |p| match pipe.bytes_packet(p, sink, on_frame) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        result = Err(e);
-                        false
-                    }
-                });
-            pipe.core.stats.bytes_skipped = self.framer.bytes_skipped;
-            pipe.core.stats.sync_losses = self.framer.sync_losses;
-        }
-        let r = result.and_then(|()| pipe.finish(sink, on_frame));
+        self.end_input_with(sink, on_frame)?;
+        let r = self.pipe.core.end(sink);
         self.outcome(r)?;
         self.finished = true;
         Ok(self.stats())
@@ -1202,7 +1231,9 @@ impl Pipeline {
         Ok(())
     }
 
-    fn finish<S, F>(&mut self, sink: &mut S, on_frame: &mut F) -> Result<(), InjectError>
+    /// Process every packet still held: the input held for the tables and
+    /// the internal timeline's last PCR interval.
+    fn flush_held<S, F>(&mut self, sink: &mut S, on_frame: &mut F) -> Result<(), InjectError>
     where
         S: PacketSink + ?Sized,
         F: FnMut(&Frame, &mut Units<'_>) + ?Sized,
@@ -1220,6 +1251,6 @@ impl Pipeline {
             });
             result?;
         }
-        self.core.end(sink)
+        Ok(())
     }
 }

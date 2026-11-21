@@ -465,6 +465,7 @@ fn c_program_injects_klv() {
         "NO_PTS -2".into(),
         "ERR invalid unit: synchronous KLV needs a PTS (R-ST1402TIME-17)".into(),
         "NO_SINK -1".into(),
+        "PUSH_AFTER_END -2".into(),
         "FRAMES 30 clock=30 inserted=30 klv_pid=0x0101".into(),
         format!("STATS in={packets} out={} units=30 late=0 out_bytes=match", ts.len() / 188),
         "TARGET program=1 pmt=0x1000 pcr=0x0100 video=0x0100 klv=0x0101 service=0 carriage=1 flags=2".into(),

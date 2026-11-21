@@ -222,6 +222,8 @@ int main(int argc, char **argv) {
         size_t n = in_len - at < 1316 ? in_len - at : 1316;
         check("push", mpegts_injector_push(injector, in + at, n, collect, &out, on_frame, &frames));
     }
+    check("end_input", mpegts_injector_end_input(injector, collect, &out, on_frame, &frames));
+    printf("PUSH_AFTER_END %d\n", mpegts_injector_push(injector, in, 188, collect, &out, on_frame, &frames));
     stats.struct_size = sizeof stats;
     check("finish", mpegts_injector_finish(injector, collect, &out, on_frame, &frames, &stats));
     printf("FRAMES %u clock=%u inserted=%u klv_pid=0x%04x\n", frames.count, frames.with_clock, frames.inserted,

@@ -760,6 +760,12 @@ mpegts_status mpegts_inject_units_insert(mpegts_inject_units *units, const mpegt
 /* Program clock at the frame (MPEGTS_EMPTY before the first PCR). */
 mpegts_status mpegts_inject_units_clock(const mpegts_inject_units *units, uint64_t *clock);
 mpegts_status mpegts_inject_units_target(const mpegts_inject_units *units, mpegts_inject_target *target);
+/* The input has ended: process the packets still held (frames among them
+ * go to on_frame, which may be NULL) without ending the stream, so units
+ * for the last frames can still be inserted before
+ * mpegts_injector_finish. Pushing afterwards is MPEGTS_ERR_INVALID. */
+mpegts_status mpegts_injector_end_input(mpegts_injector *injector, mpegts_packets_fn sink, void *sink_user,
+                                        mpegts_frame_fn on_frame, void *frame_user);
 /* End of input: flush, send what can still be placed, count the rest.
  * Frames still held (after the last PCR) go to on_frame (may be NULL).
  * stats may be NULL. */
