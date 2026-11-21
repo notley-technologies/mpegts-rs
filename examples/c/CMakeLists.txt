@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.10)
 project(mpegts_examples C)
 
 option(MPEGTS_STATIC "Link mpegts statically" OFF)
-find_package(mpegts 0.1 REQUIRED)
+find_package(mpegts 0.2 REQUIRED)
 
 add_executable(klv_dump klv_dump.c)
 if(MPEGTS_STATIC)

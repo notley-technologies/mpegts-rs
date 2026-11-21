@@ -1,9 +1,9 @@
 [package]
 name = "mpegts"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
-description = "MPEG transport stream analyser and demultiplexer with a C API"
+description = "MPEG transport stream analyser and demultiplexer, with optional write primitives and a C API"
 repository = "https://github.com/notley-technologies/mpegts-rs"
 readme = "README.md"
 keywords = ["mpeg-ts", "transport-stream", "demuxer", "klv", "video"]
@@ -16,6 +16,15 @@ exclude = ["*.ts", "target", "fuzz"]
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [features]
+default = ["capi"]
+## Export the C ABI in include/mpegts.h. Rust consumers can disable default
+## features to compile the library with unsafe code forbidden.
+capi = []
+## Transport stream write primitives (`mpegts::mux`): TS packets, PSI
+## tables, PES packets, metadata access unit cells and the KLV carriage
+## presets of MISB ST 1402. With `capi`, also their C functions. Nothing of
+## it is compiled without this feature.
+mux = []
 ## Derive `serde::Serialize` for the report types.
 serde = ["dep:serde"]
 
@@ -25,9 +34,36 @@ serde = { version = "1", features = ["derive"], optional = true }
 [dev-dependencies]
 serde_json = "1"
 
+[[test]]
+name = "c_abi"
+required-features = ["capi"]
+
+[[test]]
+name = "c_install"
+required-features = ["capi"]
+
+[[test]]
+name = "c_mux"
+required-features = ["capi", "mux"]
+
+[[test]]
+name = "mux"
+required-features = ["mux"]
+
+[[test]]
+name = "mux_alloc"
+required-features = ["mux"]
+
 [[example]]
 name = "json"
 required-features = ["serde"]
+
+[[example]]
+name = "mux"
+required-features = ["mux"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 # Applies when this crate is built on its own (C library, examples), not
 # when it is a dependency.

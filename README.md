@@ -4,6 +4,8 @@ A fast MPEG transport stream (ISO/IEC 13818-1) analyser and demultiplexer. Feed 
 
 It identifies streams but does not decode them, and it never modifies the input. It does no I/O: your application reads files or sockets and hands the bytes over. There is a Rust API and a C API with a stable ABI.
 
+With the optional `mux` feature it also writes transport streams: TS packets, PAT and PMT, PES packets, and KLV metadata in both MISB ST 1402 carriages (see [Writing](#writing)).
+
 ## Usage
 
 Whole buffer:
@@ -106,9 +108,53 @@ demux.subscribe(Subscription::new(Select::Codec(Codec::KlvAsync), Unit::Pes).wit
 
 `output_stats()` reports queued, dropped, damaged and truncated outputs and current memory use.
 
+## Writing
+
+The `mux` feature (off by default; a build without it compiles none of this) adds `mpegts::mux`, the primitives for producing a transport stream:
+
+| Type | Writes |
+|---|---|
+| `TsWriter` | the packets of one PID: continuity counter, payload_unit_start_indicator, adaptation field (PCR, discontinuity, random access), stuffing |
+| `ProgramTables` | the PAT and PMTs with descriptors, version numbers and CRCs; every change is checked whole (PID conflicts, 1021-byte section limit) and bumps the versions it touches, or is refused with nothing changed |
+| `PesWriter` | PES packets of one stream in a `Carriage`: plain PES (video, audio, private data), synchronous metadata in access unit cells, or asynchronous KLV per SMPTE RP 217 |
+| `StreamSpec` | a stream's PMT entry and PES format, with presets such as `StreamSpec::klv_sync(service_id)`, `StreamSpec::klv_async()`, `StreamSpec::h264()` |
+
+```rust
+use mpegts::mux::{PesUnit, PesWriter, ProgramTables, StreamSpec};
+
+let video = StreamSpec::h264();
+let klv = StreamSpec::klv_sync(0);           // stream_type 0x15, stream_id 0xFC, ST 1402 descriptors
+let mut tables = ProgramTables::new(1);
+tables.add_program(1, 0x1000, Some(0x100))?;  // program 1, PMT on 0x1000, PCR on the video PID
+tables.add_stream(1, 0x100, &video)?;
+tables.add_stream(1, 0x101, &klv)?;
+
+let mut video_out = PesWriter::new(0x100, &video)?;
+let mut klv_out = PesWriter::new(0x101, &klv)?;
+let mut out = Vec::new();                     // or a closure, or a fixed buffer (SliceSink)
+tables.write_all(&mut out)?;                  // repeat at least every 100 ms
+video_out.write(&PesUnit::new(&frame).with_pts(pts).with_pcr(pcr).with_random_access(), &mut out)?;
+klv_out.write(&PesUnit::new(&st0601_packet).with_pts(pts), &mut out)?;
+```
+
+- Every writer emits whole 188-byte packets into a `PacketSink`: a closure, a `Vec<u8>`, or a caller's buffer through `SliceSink`. Writing never allocates (configuring tables and specs does), so the writers suit targets without an allocator.
+- A write either completes or fails before emitting anything: too small a sink gives `MuxError::BufferTooSmall` with the size needed, and no continuity counter, cell sequence number or version moves.
+- Units are checked against their carriage: synchronous KLV needs a PTS and never has a DTS or PCR; asynchronous KLV has no PTS. Synchronous access units above 65,522 bytes are fragmented into one cell per PES packet, each with the access unit's PTS; asynchronous KLV items above 65,532 bytes are split. Non-video PES packets always carry a real `PES_packet_length`.
+- `ProgramTables::from_report(&report)` rebuilds the tables the demuxer saw, descriptors verbatim, so a tool can rewrite an input's PMT; a change bumps the input's version by one.
+- The values written (descriptor bytes, header flags, cell flags) are the phase 0 decisions in [docs/standards/DECISIONS.md](docs/standards/DECISIONS.md); the code cites the rule behind each one.
+
+`examples/mux.rs` writes a complete synthetic stream (16x16 H.264, synchronous and asynchronous KLV) that players and `ffprobe` read:
+
+```bash
+cargo run --features mux --example mux -- out.ts --frames 300
+ffprobe -show_streams -show_packets out.ts
+```
+
+On the read side, without any feature, `PacketHeader::parse` and `PesHeader::parse` decode single packets and PES headers, and `PcrTimeline` gives every packet its time on the program clock (interpolated between PCRs, continuous across clock jumps), which pass-through tools need to pace or insert packets.
+
 ## C API
 
-The header is [include/mpegts.h](include/mpegts.h). Its opening comment states the rules every function follows: status codes, NULL checks, structs that carry their size so fields can be added compatibly, thread use and pointer lifetimes. No panic crosses into C. [examples/c/klv_dump.c](examples/c/klv_dump.c) shows the usual flow.
+The header is [include/mpegts.h](include/mpegts.h). Its opening comment states the rules every function follows: status codes, NULL checks, structs that carry their size so fields can be added compatibly, thread use, pointer lifetimes and output buffers. No panic crosses into C. [examples/c/klv_dump.c](examples/c/klv_dump.c) shows the usual flow. The write side is there too (`mpegts_program_tables_*`, `mpegts_pes_writer_*`), writing packets into the caller's buffer; `make` builds the library with it.
 
 Install the shared and static libraries, the header, a pkg-config file and a CMake package:
 
@@ -124,7 +170,7 @@ cc app.c $(pkg-config --cflags --libs mpegts)
 ```
 
 ```cmake
-find_package(mpegts 0.1 REQUIRED)
+find_package(mpegts 0.2 REQUIRED)
 target_link_libraries(app PRIVATE mpegts::mpegts)   # or mpegts::mpegts_static
 ```
 
@@ -148,6 +194,7 @@ cargo run --release --example tsinfo -- capture.ts            # table of what is
 cargo run --release --example tsinfo -- capture.ts --live     # report on each change
 cargo run --release --example extract -- capture.ts --out -   # KLV payloads to stdout
 cargo run --release --features serde --example json -- capture.ts
+cargo run --release --features mux --example mux -- out.ts      # write a synthetic stream
 ```
 
 `extract` takes `--select klv|video|audio|metadata|psi|all|pid=N|program=N`, `--unit pes|packets|sections`, `--history N` and `--strip-mau`.
@@ -161,21 +208,36 @@ cargo run --release --example throughput -- capture.ts --runs 50 --chunk whole,1
 
 Prints min, mean, median, p95, p99 and max per chunk size, in milliseconds and MB/s. `--extract none|klv|pes|packets|sections` measures with extraction running.
 
+## Features
+
+| Feature | Default | Adds |
+|---|---|---|
+| `capi` | on | the C ABI. Without it the library is compiled with `#![forbid(unsafe_code)]`. |
+| `mux` | off | `mpegts::mux`, the write primitives, and with `capi` their C functions |
+| `serde` | off | `Serialize` for the report types |
+
 ## Tests
 
 ```bash
 cargo test --all-features
 ```
 
-The C tests compile programs against the header and the shared library, check that exported symbols match the header, and run `make install` into a temporary prefix to build the example through pkg-config and CMake, shared and static. Each part is skipped when its tools are missing.
+The C tests compile programs against the header and the shared library, check that exported symbols match the header (and that a default build exports none of the write side), write a stream from C and read it back, and run `make install` into a temporary prefix to build the example through pkg-config and CMake, shared and static. Each part is skipped when its tools are missing.
+
+The write side is also checked against FFmpeg with the KLV patch series (`ffmpeg-klv-fix`) when you point the tests at it:
+
+```bash
+MPEGTS_FFPROBE=/path/to/ffprobe MPEGTS_FFMPEG=/path/to/ffmpeg cargo test --features mux --test mux
+```
 
 ## Fuzzing
 
-Three harnesses in [tests/harness](tests/harness/mod.rs) accept any bytes. They check that nothing panics, results do not depend on how input is split into pushes, every buffer stays within its `Config` limit, and the C API returns only documented status codes:
+Four harnesses in [tests/harness](tests/harness/mod.rs) accept any bytes. They check that nothing panics, results do not depend on how input is split into pushes, every buffer stays within its `Config` limit, and the C API returns only documented status codes:
 
 - `demux`: raw bytes.
 - `stream`: the bytes drive a generator of tables, PES packets, PCRs and corruption, so mutations explore stream structure.
-- `capi`: sequences of C API calls, including invalid arguments and mismatched struct sizes.
+- `capi`: sequences of C API calls, including invalid arguments and mismatched struct sizes (with `mux`, the write side's calls too).
+- `mux`: random tables, streams, units, sink sizes and counter changes for the write primitives; everything accepted must obey the packet rules and read back unchanged through the demuxer.
 
 `cargo test` runs them over a few thousand mutated inputs on the stable toolchain. For longer runs, or coverage-guided fuzzing with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz):
 

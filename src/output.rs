@@ -490,10 +490,12 @@ impl Outputs {
         self.history.iter().map(|h| (h.packet, &h.data))
     }
 
+    #[cfg(feature = "capi")]
     pub fn history_len(&self) -> usize {
         self.history.len()
     }
 
+    #[cfg(feature = "capi")]
     pub fn history_get(&self, i: usize) -> Option<(u64, &[u8; PACKET_SIZE])> {
         self.history.get(i).map(|h| (h.packet, &h.data))
     }

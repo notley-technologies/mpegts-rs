@@ -515,10 +515,13 @@ impl Demuxer {
         self.out.history()
     }
 
+    // Indexed access for the C ABI.
+    #[cfg(feature = "capi")]
     pub(crate) fn history_len(&self) -> usize {
         self.out.history_len()
     }
 
+    #[cfg(feature = "capi")]
     pub(crate) fn history_get(&self, i: usize) -> Option<(u64, &[u8; PACKET_SIZE])> {
         self.out.history_get(i)
     }
@@ -1409,7 +1412,7 @@ pub(crate) fn read_timestamp(b: &[u8]) -> u64 {
 }
 
 /// 27 MHz PCR from its 6-byte encoding.
-fn read_pcr(b: &[u8]) -> u64 {
+pub(crate) fn read_pcr(b: &[u8]) -> u64 {
     let base = u64::from(b[0]) << 25
         | u64::from(b[1]) << 17
         | u64::from(b[2]) << 9

@@ -98,6 +98,15 @@ fn install_then_build_with_pkg_config_and_cmake() {
     if let Some(dynamic) = needed_libraries(&lib.join("libmpegts.so.1")) {
         assert!(dynamic.contains("Library soname: [libmpegts.so.1]"), "{dynamic}");
     }
+    // `make` builds the write side too, so both libraries export it.
+    if have("nm") {
+        for (args, file) in [(&["-D", "--defined-only"][..], "libmpegts.so.1"), (&["--defined-only"][..], "libmpegts.a")] {
+            let symbols = text(run(Command::new("nm").args(args).arg(lib.join(file))));
+            for f in ["mpegts_demuxer_new", "mpegts_pes_writer_write", "mpegts_program_tables_write_all"] {
+                assert!(symbols.lines().any(|l| l.ends_with(&format!(" {f}"))), "{file} does not export {f}");
+            }
+        }
+    }
 
     let input = sample(&work);
     let pkg_config = |args: &[&str]| -> Vec<String> {
@@ -153,11 +162,15 @@ fn install_then_build_with_pkg_config_and_cmake() {
             run(Command::new("cmake").arg("--build").arg(&build));
             assert_eq!(text(run(Command::new(build.join("klv_dump")).arg(&input))), EXPECTED, "{name}");
         }
+        // While the major version is 0, the next minor version is a
+        // different API: asking for it must fail.
+        let minor: u32 = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap();
+        let newer = format!("{}.{}", env!("CARGO_PKG_VERSION_MAJOR"), minor + 1);
         let project = work.join("needs-newer");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(
             project.join("CMakeLists.txt"),
-            "cmake_minimum_required(VERSION 3.10)\nproject(t C)\nfind_package(mpegts 0.2 REQUIRED)\n",
+            format!("cmake_minimum_required(VERSION 3.10)\nproject(t C)\nfind_package(mpegts {newer} REQUIRED)\n"),
         )
         .unwrap();
         let refused = Command::new("cmake")
@@ -169,8 +182,9 @@ fn install_then_build_with_pkg_config_and_cmake() {
             .output()
             .unwrap();
         let why = String::from_utf8_lossy(&refused.stderr);
-        assert!(!refused.status.success(), "0.1 must not satisfy a request for 0.2");
-        assert!(why.contains("considered but not accepted") && why.contains("version: 0.1.0"), "{why}");
+        assert!(!refused.status.success(), "{} must not satisfy a request for {newer}", env!("CARGO_PKG_VERSION"));
+        let found = format!("version: {}", env!("CARGO_PKG_VERSION"));
+        assert!(why.contains("considered but not accepted") && why.contains(&found), "{why}");
     } else {
         eprintln!("skipping the CMake part: no cmake");
     }

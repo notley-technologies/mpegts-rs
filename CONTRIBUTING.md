@@ -26,7 +26,14 @@ Before opening a pull request:
 
 ```bash
 RUSTFLAGS="-D warnings" cargo build --all-targets --all-features
+RUSTFLAGS="-D warnings" cargo build --lib --no-default-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+```
+
+For changes to the write side (`mux` feature), also run its tests against FFmpeg with the KLV patch series if you have it:
+
+```bash
+MPEGTS_FFPROBE=/path/to/ffprobe MPEGTS_FFMPEG=/path/to/ffmpeg cargo test --features mux --test mux
 ```
 
 For changes to parsing or extraction, a longer fuzz run is worth it:
@@ -44,7 +51,8 @@ If the fuzzer finds a failing input, fix the bug and add the input to `tests/fuz
 - **Bounded memory.** Anything that buffers data must have a limit in `Config` or a fixed cap. Hostile input must not be able to grow memory without bound.
 - **Hot path.** Per-packet work should stay constant time. Run the throughput example before and after changes to the demuxer and include the numbers in the pull request.
 - **C ABI.** Within an `MPEGTS_ABI_VERSION`, only add: new functions, new constants, and new fields at the end of structs. Never change or remove existing ones, and never reuse a codec code. Update `include/mpegts.h` alongside `src/capi.rs`; the tests check that the two agree.
-- **Standards.** When identifying a new stream type or descriptor, cite the document and section in a comment.
+- **Standards.** When identifying a new stream type or descriptor, cite the document and section in a comment. On the write side, cite the rule id from `docs/standards/` (for example R-ISO13818-051) for every value or rule implemented; `DECISIONS.md` there wins over the other notes.
+- **Writing without allocating.** The `mux` writers emit into a `PacketSink` and build packets, headers and sections on the stack; `tests/mux_alloc.rs` checks that the write path never allocates. Keep allocation to configuration (tables, stream specs).
 - **Style.** Match the surrounding code. Comments explain why, not what. Use hyphens, not em dashes.
 
 ## Pull requests

@@ -70,6 +70,7 @@ fn header_constants_match_rust() {
         ("MPEGTS_ERR_NOT_FOUND", MPEGTS_ERR_NOT_FOUND.into()),
         ("MPEGTS_ERR_PANIC", MPEGTS_ERR_PANIC.into()),
         ("MPEGTS_ERR_POISONED", MPEGTS_ERR_POISONED.into()),
+        ("MPEGTS_ERR_BUFFER", MPEGTS_ERR_BUFFER.into()),
         ("MPEGTS_UNIT_PACKETS", mpegts::Unit::Packets as i64),
         ("MPEGTS_UNIT_PES", mpegts::Unit::Pes as i64),
         ("MPEGTS_UNIT_SECTIONS", mpegts::Unit::Sections as i64),
@@ -109,21 +110,60 @@ fn exported_symbols_match_header() {
         eprintln!("skipping: needs Linux and nm");
         return;
     }
-    let lib = build_library().join("libmpegts.so");
-    let out = Command::new("nm").args(["-D", "--defined-only"]).arg(&lib).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let exported: BTreeSet<String> = String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
-        .filter_map(|l| l.split_whitespace().last())
-        .map(|s| s.trim_start_matches('_').to_string())
-        .collect();
+    let exported = dynamic_symbols(&build_library().join("libmpegts.so"));
     let declared = header_functions();
-    assert_eq!(declared.len(), 29, "header functions: {declared:?}");
+    // 29 for reading, 37 for writing (built with the `mux` feature).
+    assert_eq!(declared.len(), 66, "header functions: {declared:?}");
     let missing: Vec<_> = declared.difference(&exported).collect();
     let extra: Vec<_> = exported.difference(&declared).collect();
     assert!(missing.is_empty(), "declared in the header but not exported: {missing:?}");
     assert!(extra.is_empty(), "exported but not in the header: {extra:?}");
+}
+
+/// Write-side functions (feature `mux`).
+fn is_write_side(name: &str) -> bool {
+    ["mpegts_program_tables_", "mpegts_pes_writer_", "mpegts_stream_spec_", "mpegts_null_packet"]
+        .iter()
+        .any(|p| name.starts_with(p))
+}
+
+fn dynamic_symbols(lib: &Path) -> BTreeSet<String> {
+    let out = Command::new("nm").args(["-D", "--defined-only"]).arg(lib).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.split_whitespace().last())
+        .map(|s| s.trim_start_matches('_').to_string())
+        .collect()
+}
+
+/// A build with default features compiles none of the write side: the C
+/// library exports only the reading functions, and the Rust library holds
+/// no `mpegts::mux` code.
+#[test]
+fn default_build_has_no_write_side() {
+    if !cfg!(target_os = "linux") || Command::new("nm").arg("--version").output().is_err() {
+        eprintln!("skipping: needs Linux and nm");
+        return;
+    }
+    let target = root().join("target/c-abi-default");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(cargo)
+        .args(["build", "--lib", "--quiet", "--offline"])
+        .env("CARGO_TARGET_DIR", &target)
+        .current_dir(root())
+        .status()
+        .unwrap();
+    assert!(status.success(), "cargo build with default features failed");
+    let exported = dynamic_symbols(&target.join("debug/libmpegts.so"));
+    let reading: BTreeSet<String> = header_functions().into_iter().filter(|f| !is_write_side(f)).collect();
+    assert_eq!(reading.len(), 29);
+    assert_eq!(exported, reading, "a default build exports exactly the reading functions");
+    let rlib = Command::new("nm").arg(target.join("debug/libmpegts.rlib")).output().unwrap();
+    let symbols = String::from_utf8_lossy(&rlib.stdout);
+    assert!(symbols.contains("6mpegts7demuxer"), "nm did not list the rlib's symbols");
+    assert!(!symbols.contains("6mpegts3mux"), "mpegts::mux code in a default build");
 }
 
 macro_rules! size {
@@ -263,12 +303,14 @@ fn compiler() -> Option<&'static str> {
 }
 
 /// Build the shared library into its own target directory (so it does not
-/// wait on the cargo running this test) and return where it is.
+/// wait on the cargo running this test) and return where it is. It is
+/// built as `make` builds it, with the `mux` feature, so that it exports
+/// everything the header declares.
 fn build_library() -> PathBuf {
     let target = root().join("target/c-abi");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let status = Command::new(cargo)
-        .args(["build", "--lib", "--quiet", "--offline"])
+        .args(["build", "--lib", "--quiet", "--offline", "--features", "mux"])
         .env("CARGO_TARGET_DIR", &target)
         .current_dir(root())
         .status()

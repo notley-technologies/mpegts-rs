@@ -7,9 +7,16 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# Mirror the library's features, so the shared harness in
+# tests/harness/mod.rs sees the same `cfg(feature = ...)` as the tests.
+[features]
+default = ["capi", "mux"]
+capi = ["mpegts/capi"]
+mux = ["mpegts/mux"]
+
 [dependencies]
 libfuzzer-sys = "0.4"
-mpegts = { path = ".." }
+mpegts = { path = "..", default-features = false }
 
 # Not part of the main crate's build.
 [workspace]
@@ -35,6 +42,15 @@ bench = false
 [[bin]]
 name = "capi"
 path = "fuzz_targets/capi.rs"
+required-features = ["capi"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux"
+path = "fuzz_targets/mux.rs"
+required-features = ["mux"]
 test = false
 doc = false
 bench = false

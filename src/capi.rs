@@ -23,6 +23,7 @@ pub const MPEGTS_ERR_RANGE: i32 = -3;
 pub const MPEGTS_ERR_NOT_FOUND: i32 = -4;
 pub const MPEGTS_ERR_PANIC: i32 = -5;
 pub const MPEGTS_ERR_POISONED: i32 = -6;
+pub const MPEGTS_ERR_BUFFER: i32 = -7;
 
 const OUTPUT_HAS_STREAM_ID: u32 = 0x01;
 const OUTPUT_HAS_TABLE_ID: u32 = 0x02;
@@ -441,7 +442,8 @@ pub extern "C" fn mpegts_status_string(status: mpegts_status) -> *const c_char {
         MPEGTS_ERR_RANGE => "index out of range\0",
         MPEGTS_ERR_NOT_FOUND => "not found\0",
         MPEGTS_ERR_PANIC => "internal error\0",
-        MPEGTS_ERR_POISONED => "demuxer unusable after an internal error\0",
+        MPEGTS_ERR_POISONED => "unusable after an internal error\0",
+        MPEGTS_ERR_BUFFER => "output buffer too small\0",
         _ => "unknown status\0",
     };
     s.as_ptr() as *const c_char
@@ -948,6 +950,12 @@ pub unsafe extern "C" fn mpegts_report_stream_descriptor(
     let d = &s.descriptors[check!(index(descriptor_index, s.descriptors.len()))];
     write_descriptor(d, tag, data, len)
 }
+
+// The write side (feature `mux`); after the helpers above, which it uses.
+#[cfg(feature = "mux")]
+mod mux;
+#[cfg(feature = "mux")]
+pub use mux::*;
 
 #[cfg(test)]
 mod tests;

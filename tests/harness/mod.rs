@@ -9,21 +9,34 @@
 //! - every buffer stays within its `Config` limit;
 //! - reports and outputs are internally consistent;
 //! - the C API returns only documented status codes and never reports an
-//!   internal error.
+//!   internal error;
+//! - what the write primitives write (feature `mux`) obeys the packet rules
+//!   and reads back unchanged.
 #![allow(dead_code)]
 
 #[path = "../common/mod.rs"]
 pub mod common;
 
 use common::*;
+#[cfg(feature = "capi")]
 use mpegts::capi::*;
 use mpegts::{
     crc32_mpeg2, Codec, Config, Demuxer, Output, Overflow, Report, Select, StreamKind, Subscription,
     SubscriptionId, Unit,
 };
+#[cfg(feature = "capi")]
 use std::ffi::CStr;
 use std::hint::black_box;
-use std::{mem, ptr};
+use std::mem;
+#[cfg(feature = "capi")]
+use std::ptr;
+
+#[cfg(feature = "mux")]
+mod mux;
+// Each fuzz target uses one harness; the rest is unused there.
+#[cfg(feature = "mux")]
+#[allow(unused_imports)]
+pub use mux::{mux, mux_run};
 
 /// Most packets one generated stream holds, to keep each run fast.
 const MAX_PACKETS: usize = 3000;
@@ -62,7 +75,9 @@ pub fn stream(data: &[u8]) {
 }
 
 /// The C API: the first part of the input is a sequence of API calls, the
-/// rest builds the stream they push.
+/// rest builds the stream they push. With the `mux` feature the calls
+/// also drive the write side.
+#[cfg(feature = "capi")]
 pub fn capi(data: &[u8]) {
     let mut input = Input::new(data);
     let ops_len = usize::from(input.u8()) * 2;
@@ -70,7 +85,11 @@ pub fn capi(data: &[u8]) {
     let ts = generate(&mut input);
     // SAFETY: every pointer handed to the API points at live, correctly
     // sized memory owned by this function.
-    unsafe { capi_session(&mut ops, &ts) }
+    unsafe {
+        capi_session(&mut ops, &ts);
+        #[cfg(feature = "mux")]
+        mux::capi_mux_session(&mut Input::new(data));
+    }
 }
 
 // ---------------------------------------------------------------- input
@@ -757,10 +776,12 @@ pub fn check_report(r: &Report, config: &Config, input_len: usize) {
 
 // ---------------------------------------------------------------- C API
 
-fn expect(status: mpegts_status, allowed: &[mpegts_status], call: &str) {
+#[cfg(feature = "capi")]
+pub(crate) fn expect(status: mpegts_status, allowed: &[mpegts_status], call: &str) {
     assert!(allowed.contains(&status), "{call} returned {status}");
 }
 
+#[cfg(feature = "capi")]
 /// Read every byte, so a bad pointer is caught (by a sanitizer, or a crash).
 unsafe fn touch(data: *const u8, len: usize) {
     if len > 0 {
@@ -769,6 +790,7 @@ unsafe fn touch(data: *const u8, len: usize) {
     }
 }
 
+#[cfg(feature = "capi")]
 /// A `struct_size` for `T`: usually exact, sometimes an older (shorter) or
 /// newer (longer) struct, sometimes invalid.
 fn struct_size<T>(ops: &mut Input<'_>) -> u32 {
@@ -780,8 +802,10 @@ fn struct_size<T>(ops: &mut Input<'_>) -> u32 {
     }
 }
 
+#[cfg(feature = "capi")]
 const OUTPUT_FIELDS_END: usize = mem::size_of::<mpegts_output>();
 
+#[cfg(feature = "capi")]
 unsafe fn capi_session(ops: &mut Input<'_>, ts: &[u8]) {
     const OK: &[i32] = &[MPEGTS_OK];
 
@@ -934,6 +958,7 @@ unsafe fn capi_session(ops: &mut Input<'_>, ts: &[u8]) {
     mpegts_report_free(r);
 }
 
+#[cfg(feature = "capi")]
 unsafe fn next_output(d: *mut mpegts_demuxer, size: u32) -> mpegts_status {
     let mut out: mpegts_output = mem::zeroed();
     out.struct_size = size;
@@ -951,6 +976,7 @@ unsafe fn next_output(d: *mut mpegts_demuxer, size: u32) -> mpegts_status {
     status
 }
 
+#[cfg(feature = "capi")]
 unsafe fn walk_report(r: *const mpegts_report, ops: &mut Input<'_>) {
     const OK: &[i32] = &[MPEGTS_OK];
     const RANGE: &[i32] = &[MPEGTS_ERR_RANGE];

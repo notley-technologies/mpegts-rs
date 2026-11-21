@@ -8,7 +8,9 @@
 # PREFIX (default /usr/local), LIBDIR, INCLUDEDIR and DESTDIR are honoured,
 # as are CARGO and CARGO_FLAGS (e.g. CARGO_FLAGS=--offline). On macOS the
 # install path is built into the library, so pass the same PREFIX/LIBDIR
-# to `make` and `make install`.
+# to `make` and `make install`. FEATURES (default `mux`) are the Cargo
+# features added to the default `capi`; with `mux` the library exports every
+# function mpegts.h declares.
 
 PREFIX      ?= /usr/local
 LIBDIR      ?= $(PREFIX)/lib
@@ -16,6 +18,7 @@ INCLUDEDIR  ?= $(PREFIX)/include
 DESTDIR     ?=
 CARGO       ?= cargo
 CARGO_FLAGS ?=
+FEATURES    ?= mux
 PROFILE     ?= release
 TARGET_DIR  ?= target/c
 
@@ -54,14 +57,14 @@ all: $(SHARED_LIB) $(STATIC_LIB)
 # Cargo may leave an up-to-date file untouched, hence the touch.
 $(SHARED_LIB): $(SOURCES)
 	@test -n "$(VERSION)" -a -n "$(ABI)" || { echo "cannot read the version from Cargo.toml and include/mpegts.h"; exit 1; }
-	$(CARGO) rustc --color never $(CARGO_FLAGS) --lib --profile $(PROFILE) --crate-type cdylib --target-dir $(TARGET_DIR) \
-		-- -C link-arg=$(SONAME_ARG) -C strip=symbols
+	$(CARGO) rustc --color never $(CARGO_FLAGS) --features "$(FEATURES)" --lib --profile $(PROFILE) --crate-type cdylib \
+		--target-dir $(TARGET_DIR) -- -C link-arg=$(SONAME_ARG) -C strip=symbols
 	@touch $@
 
 $(STATIC_LIB): $(SOURCES)
 	@mkdir -p $(OUT)
-	$(CARGO) rustc --color never $(CARGO_FLAGS) --lib --profile $(PROFILE) --crate-type staticlib --target-dir $(TARGET_DIR) \
-		-- --print native-static-libs 2> $(OUT)/staticlib.log || { cat $(OUT)/staticlib.log; exit 1; }
+	$(CARGO) rustc --color never $(CARGO_FLAGS) --features "$(FEATURES)" --lib --profile $(PROFILE) --crate-type staticlib \
+		--target-dir $(TARGET_DIR) -- --print native-static-libs 2> $(OUT)/staticlib.log || { cat $(OUT)/staticlib.log; exit 1; }
 	@sed -n 's/^note: native-static-libs: //p' $(OUT)/staticlib.log | tail -n 1 > $(NATIVE)
 	@test -s $(NATIVE) || { echo "rustc did not report the static library's system libraries"; exit 1; }
 	@touch $@

@@ -154,9 +154,16 @@ fn fuzz_stream() {
     fuzz("stream", harness::stream, random_seeds(&[64, 256, 1024, 4096]), 800);
 }
 
+#[cfg(feature = "capi")]
 #[test]
 fn fuzz_capi() {
     fuzz("capi", harness::capi, random_seeds(&[64, 512, 2048]), 400);
+}
+
+#[cfg(feature = "mux")]
+#[test]
+fn fuzz_mux() {
+    fuzz("mux", harness::mux, random_seeds(&[16, 128, 1024, 4096]), 300);
 }
 
 /// The generator is only useful if what it builds gets past sync and
@@ -187,4 +194,22 @@ fn generator_reaches_deep_paths() {
     assert!(with_streams * 2 > runs, "only {with_streams}/{runs} generated streams declared a stream");
     assert!(with_pes * 4 > runs, "only {with_pes}/{runs} produced a PES");
     assert!(with_sections * 4 > runs * 3, "only {with_sections}/{runs} produced a section");
+}
+
+/// The write harness turns most random inputs into tables and units.
+#[cfg(feature = "mux")]
+#[test]
+fn mux_harness_reaches_deep_paths() {
+    let mut rng = Rng(seed());
+    let (mut writing, mut splitting, mut tables, runs) = (0, 0, 0, 300);
+    for _ in 0..runs {
+        let n = 50 + rng.below(3000);
+        let run = harness::mux_run(&random_bytes(&mut rng, n));
+        writing += usize::from(run.units > 0);
+        splitting += usize::from(run.split > 0);
+        tables += usize::from(run.table_changes > 0);
+    }
+    assert!(writing * 2 > runs, "only {writing}/{runs} runs wrote a unit");
+    assert!(splitting * 20 > runs, "only {splitting}/{runs} runs split a unit");
+    assert!(tables * 2 > runs, "only {tables}/{runs} runs changed the tables");
 }

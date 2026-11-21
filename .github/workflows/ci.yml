@@ -37,6 +37,14 @@ jobs:
       - run: cargo build --all-targets --all-features
         env:
           RUSTFLAGS: -D warnings
+      # Every feature set builds cleanly: without the C ABI (unsafe code
+      # forbidden), and the write side on its own.
+      - run: |
+          cargo build --lib --no-default-features
+          cargo build --lib --no-default-features --features mux
+          cargo test --no-default-features --features mux --no-run
+        env:
+          RUSTFLAGS: -D warnings
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
@@ -48,6 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.70
       # The optional serde feature's dependencies need a newer compiler.
       - run: cargo check --lib
+      - run: cargo check --lib --features mux
 
   c-package-macos:
     runs-on: macos-latest
@@ -74,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [demux, stream, capi]
+        target: [demux, stream, capi, mux]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

@@ -1,6 +1,6 @@
 # Standards notes for the write path
 
-These documents record what the MPEG-TS write path (the planned `mux` feature: TS, PSI and PES writers, metadata access unit cells, KLV injection) must do to conform, settled before any code was written. Every rule cites the standard, section or requirement id, with a short verbatim quote.
+These documents record what the MPEG-TS write path (the `mux` feature: TS, PSI and PES writers, metadata access unit cells, later KLV injection) must do to conform, settled before any code was written. The code cites the rule ids defined here. Every rule cites the standard, section or requirement id, with a short verbatim quote.
 
 | File | Covers |
 |---|---|

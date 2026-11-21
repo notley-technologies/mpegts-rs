@@ -23,6 +23,8 @@ This file records (1) where two topics disagreed and what wins, (2) values settl
 
 **X-5 Item 136 (Leap Seconds) value and sign.** Left open by both `st0601-encode.md` U-08 and `st1402-time.md` U-6. ST 0601.19 8.136: "Number of leap seconds since MISP Epoch to use when converting Precision Time Stamp (Item 2) to UTC" (`specs/src/ST0601.19.txt:6966`); the Handbook defines MISP = TAI - 8.000082 s (Table 17, `specs/src/MISP-2025.1-Motion-Imagery-Handbook.txt:2600`). **Decision: the value is round(TAI-UTC - 8.000082 s) from the leap second table, which is 29 for instants since 2017-01-01; UTC = tag 2 - (item 136 x 1,000,000) us (approximate to 82 us; exact conversion uses the table).** The ST 0601 example value 30 is a sample. Item 136 is optional and not in the ST 0902 minimum set: not written by default; option `leap_seconds_item`. The misb decoder's `Tag::LeapSeconds` doc has the sign backwards (it says "plus") and must be fixed (prerequisite P-3).
 
+**X-6 data_alignment_indicator of sync KLV PES packets (decided 2026-11-20).** `st1402-time.md` D-8 wrote 1 on every sync PES; `iso13818.md` D-ISO13818-08 wrote 1 only when the PES begins an access unit. Both standards are silent for stream_id 0xFC. **Decision: D-ISO13818-08. 1 when the PES packet's first cell has cell_fragment_indication '11' or '10' (it begins an access unit), 0 on the PES packets of middle and last fragments.** Reason: it mirrors the normative asynchronous rule (ST 1402-20/-21: 1 exactly when the PES contains the beginning of a KLV item) and the cell-level random_access_indicator (R-ST1402TIME-32), so a receiver can resynchronise on it; "always 1" carries no information. It only differs from D-8 for access units above 65,522 bytes. Implemented in `mpegts::mux::PesWriter`.
+
 ## 2. Values settled (quick reference)
 
 | Subject | Value | Source |
@@ -38,7 +40,7 @@ This file records (1) where two topics disagreed and what wins, (2) values settl
 | Packet size cap (encoder default) | 65,535 bytes | st0601-encode |
 | Sync KLV stream | stream_type 0x15, stream_id 0xFC, PTS only (14-byte PES header), one AU = one KLV packet per cell per PES | iso13818, st1402-time |
 | Sync PMT ES descriptors | `26 09 01 00 FF 4B 4C 56 41 00 0F` (per service) + `27 09 FF FF FF C0 04 00 C0 00 00` (per stream) | X-1, X-2 |
-| AU cell flags | `DF` complete, `9F` first, `0F` middle, `4F` last; sequence_number one counter per PID mod 256 | iso13818, st1402-time |
+| AU cell flags | `DF` complete, `9F` first, `0F` middle, `4F` last; sequence_number one counter per PID mod 256; PES data_alignment_indicator 1 only on the PES that begins the AU (X-6) | iso13818, st1402-time |
 | Max cell data | 65,522 bytes; every PES of a fragmented AU carries the AU's PTS | iso13818 |
 | Async KLV stream | stream_type 0x06, stream_id 0xBD, no PTS, registration `05 04 4B 4C 56 41` | iso13818, st1402-time |
 | Sync insertion window | arrival in [PTS - 1 s + 10 ms, PTS - 1 ms]; before the frame's first packet when that fits, else the first later packet that fits | iso13818 D-14, st1402-time D-7 |

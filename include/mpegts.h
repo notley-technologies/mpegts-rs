@@ -5,8 +5,9 @@
  *
  *  - Functions return an mpegts_status (0 on success, negative on error)
  *    unless documented otherwise. They never abort or unwind into C; an
- *    internal panic is reported as MPEGTS_ERR_PANIC and the demuxer is then
- *    unusable (MPEGTS_ERR_POISONED) and must be freed.
+ *    internal panic is reported as MPEGTS_ERR_PANIC and the demuxer (or
+ *    program tables or PES writer) is then unusable (MPEGTS_ERR_POISONED)
+ *    and must be freed.
  *  - Every pointer argument is checked for NULL.
  *  - Structs that cross the boundary start with `struct_size`. Set it to
  *    sizeof(the struct) before passing it in. The library reads or writes
@@ -16,9 +17,16 @@
  *  - A demuxer is not thread-safe: use each one from one thread at a time
  *    (it may move between threads). Separate demuxers are independent. A
  *    report never changes, so any number of threads may read one at once.
+ *    Program tables and PES writers follow the demuxer's rule.
  *  - Pointers returned into a demuxer or report stay valid until the call
  *    documented for them, or until the object is freed. Strings returned
  *    by the library are static.
+ *  - Functions that write into a caller's buffer take (out, capacity,
+ *    written). On MPEGTS_OK and on MPEGTS_ERR_BUFFER, *written is the
+ *    number of bytes the output needs; pass NULL and capacity 0 to ask for
+ *    it. A buffer that is too small is left untouched and nothing changes
+ *    (no continuity counter, sequence number or version moves). `out` may
+ *    be NULL only when capacity is 0.
  *
  * Compatibility: within one MPEGTS_ABI_VERSION, functions, constants and
  * struct fields are only ever added (fields at the end), never changed.
@@ -40,9 +48,9 @@ extern "C" {
 
 /* Version of the library this header came with. */
 #define MPEGTS_VERSION_MAJOR 0
-#define MPEGTS_VERSION_MINOR 1
+#define MPEGTS_VERSION_MINOR 2
 #define MPEGTS_VERSION_PATCH 0
-#define MPEGTS_VERSION_STRING "0.1.0"
+#define MPEGTS_VERSION_STRING "0.2.0"
 
 /* ------------------------------------------------------------ status */
 
@@ -52,9 +60,10 @@ typedef int32_t mpegts_status;
 #define MPEGTS_ERR_NULL (-1)      /* a required pointer was NULL */
 #define MPEGTS_ERR_INVALID (-2)   /* an argument or struct field is invalid */
 #define MPEGTS_ERR_RANGE (-3)     /* an index is out of range */
-#define MPEGTS_ERR_NOT_FOUND (-4) /* no such subscription */
-#define MPEGTS_ERR_PANIC (-5)     /* internal error; the demuxer is poisoned */
-#define MPEGTS_ERR_POISONED (-6)  /* the demuxer failed earlier; free it */
+#define MPEGTS_ERR_NOT_FOUND (-4) /* no such subscription, program or stream */
+#define MPEGTS_ERR_PANIC (-5)     /* internal error; the object is poisoned */
+#define MPEGTS_ERR_POISONED (-6)  /* the object failed earlier; free it */
+#define MPEGTS_ERR_BUFFER (-7)    /* output buffer too small; see *written */
 
 /* ------------------------------------------------------------ codes */
 
@@ -314,7 +323,7 @@ typedef struct mpegts_pid_info {
 /* ------------------------------------------------------------ library */
 
 uint32_t mpegts_abi_version(void);
-const char *mpegts_version(void);                 /* e.g. "0.1.0" */
+const char *mpegts_version(void);                 /* e.g. "0.2.0" */
 const char *mpegts_status_string(mpegts_status status);
 const char *mpegts_codec_name(uint32_t codec);     /* NULL for unknown codes */
 uint32_t mpegts_codec_kind(uint32_t codec);        /* MPEGTS_KIND_* */
@@ -380,6 +389,161 @@ mpegts_status mpegts_report_program_descriptor(const mpegts_report *report, uint
 mpegts_status mpegts_report_stream_descriptor(const mpegts_report *report, uint32_t program_index,
                                               uint32_t stream_index, uint32_t descriptor_index,
                                               uint8_t *tag, const uint8_t **data, uint64_t *len);
+
+/* ------------------------------------------------------------ writing
+ *
+ * Transport stream write primitives: PAT and PMT, PES packets, metadata
+ * access unit cells and the KLV carriage of MISB ST 1402.2. They exist in
+ * libraries built with the `mux` feature, as `make` builds them. Output is
+ * whole 188-byte packets in the caller's buffer (see the buffer rule at the
+ * top). Values written follow docs/standards/DECISIONS.md.
+ */
+
+typedef struct mpegts_program_tables mpegts_program_tables; /* opaque */
+typedef struct mpegts_pes_writer mpegts_pes_writer;         /* opaque */
+
+/* How a stream's units become PES packets (mpegts_stream_spec.carriage). */
+#define MPEGTS_CARRIAGE_PES 1            /* video, audio, private data */
+#define MPEGTS_CARRIAGE_METADATA_CELLS 2 /* synchronous KLV: stream_id 0xFC, access
+                                          * unit cells, a PTS on every PES */
+#define MPEGTS_CARRIAGE_ASYNC_KLV 3      /* SMPTE RP 217: stream_id 0xBD, no PTS */
+
+/* mpegts_stream_spec.flags */
+#define MPEGTS_SPEC_SYNC_REGISTRATION 0x01 /* METADATA_CELLS: also write the
+                                            * "KLVA" registration_descriptor */
+
+/* A stream's PMT entry and PES format. Fill with one of the
+ * mpegts_stream_spec_* functions, then change fields if needed. */
+typedef struct mpegts_stream_spec {
+    uint32_t struct_size;
+    uint32_t carriage;    /* MPEGTS_CARRIAGE_* */
+    uint8_t stream_type;  /* PMT stream_type (0x15 sync KLV, 0x06 async KLV) */
+    uint8_t stream_id;    /* PES stream_id (0xFC sync KLV, 0xBD async KLV) */
+    uint8_t service_id;   /* METADATA_CELLS: metadata_service_id */
+    uint8_t reserved;
+    uint32_t flags;       /* MPEGTS_SPEC_* */
+    /* METADATA_CELLS: metadata_STD_descriptor fields, 22 bits each.
+     * Defaults 0x3FFFFF (x 400 bit/s), 0x400 (x 1024 bytes) and 0. */
+    uint32_t input_leak_rate;
+    uint32_t buffer_size;
+    uint32_t output_leak_rate;
+} mpegts_stream_spec;
+
+/* Plain PES with no descriptors (add them to the tables separately). */
+mpegts_status mpegts_stream_spec_pes(mpegts_stream_spec *spec, uint8_t stream_type, uint8_t stream_id);
+/* Synchronous KLV: stream_type 0x15, stream_id 0xFC, metadata_descriptor
+ * 26 09 01 00 FF 4B 4C 56 41 <service_id> 0F and metadata_STD_descriptor
+ * 27 09 FF FF FF C0 04 00 C0 00 00. */
+mpegts_status mpegts_stream_spec_klv_sync(mpegts_stream_spec *spec, uint8_t service_id);
+/* Asynchronous KLV: stream_type 0x06, stream_id 0xBD, registration "KLVA". */
+mpegts_status mpegts_stream_spec_klv_async(mpegts_stream_spec *spec);
+
+/* Program tables: a PAT and its PMTs, kept consistent. Every change is
+ * checked whole (PID ranges and conflicts, sections of at most 1024 bytes)
+ * and either applied, with the version_number of each changed table
+ * incremented, or refused with MPEGTS_ERR_INVALID (MPEGTS_ERR_NOT_FOUND for
+ * an unknown program or stream) and nothing changed. A PID of 0x1FFF means
+ * "none" for pcr_pid and the network PID. */
+mpegts_status mpegts_program_tables_new(uint16_t transport_stream_id, mpegts_program_tables **out);
+/* The tables a report describes: versions, programs, streams and
+ * descriptors verbatim. MPEGTS_ERR_INVALID until the PAT and every PMT have
+ * been received. A later change bumps each reported version by one. */
+mpegts_status mpegts_program_tables_from_report(const mpegts_report *report, mpegts_program_tables **out);
+void mpegts_program_tables_free(mpegts_program_tables *tables); /* NULL is ignored */
+/* Why the last call on `tables` failed (empty after a success), as a
+ * NUL-terminated string of at most message_len bytes. */
+mpegts_status mpegts_program_tables_error(const mpegts_program_tables *tables, char *message, size_t message_len);
+mpegts_status mpegts_program_tables_add_program(mpegts_program_tables *tables, uint16_t number, uint16_t pmt_pid,
+                                                uint16_t pcr_pid);
+mpegts_status mpegts_program_tables_remove_program(mpegts_program_tables *tables, uint16_t number);
+mpegts_status mpegts_program_tables_set_pcr_pid(mpegts_program_tables *tables, uint16_t number, uint16_t pcr_pid);
+/* The PAT's program 0 entry (network information table). */
+mpegts_status mpegts_program_tables_set_network_pid(mpegts_program_tables *tables, uint16_t pid);
+/* Descriptors are given as tag and body (without the length byte, at most
+ * 255 bytes). `data` may be NULL when len is 0. */
+mpegts_status mpegts_program_tables_add_program_descriptor(mpegts_program_tables *tables, uint16_t number,
+                                                           uint8_t tag, const uint8_t *data, size_t len);
+mpegts_status mpegts_program_tables_add_stream(mpegts_program_tables *tables, uint16_t number, uint16_t pid,
+                                               const mpegts_stream_spec *spec);
+mpegts_status mpegts_program_tables_add_stream_descriptor(mpegts_program_tables *tables, uint16_t number,
+                                                          uint16_t pid, uint8_t tag, const uint8_t *data,
+                                                          size_t len);
+mpegts_status mpegts_program_tables_remove_stream(mpegts_program_tables *tables, uint16_t number, uint16_t pid);
+mpegts_status mpegts_program_tables_pat_version(const mpegts_program_tables *tables, uint8_t *version);
+mpegts_status mpegts_program_tables_pmt_version(const mpegts_program_tables *tables, uint16_t number,
+                                                uint8_t *version);
+/* Set a version_number (0 to 31), e.g. to continue an input's numbering. */
+mpegts_status mpegts_program_tables_set_pat_version(mpegts_program_tables *tables, uint8_t version);
+mpegts_status mpegts_program_tables_set_pmt_version(mpegts_program_tables *tables, uint16_t number,
+                                                    uint8_t version);
+/* The sections themselves (at most 1024 bytes each). */
+mpegts_status mpegts_program_tables_pat_section(mpegts_program_tables *tables, uint8_t *out, size_t capacity,
+                                                size_t *written);
+mpegts_status mpegts_program_tables_pmt_section(mpegts_program_tables *tables, uint16_t number, uint8_t *out,
+                                                size_t capacity, size_t *written);
+/* The tables as TS packets: the PAT on PID 0, a PMT on its PID, or the PAT
+ * and every PMT. Repeat them at least every 100 ms (MISB ST 1402.2). */
+mpegts_status mpegts_program_tables_write_pat(mpegts_program_tables *tables, uint8_t *out, size_t capacity,
+                                              size_t *written);
+mpegts_status mpegts_program_tables_write_pmt(mpegts_program_tables *tables, uint16_t number, uint8_t *out,
+                                              size_t capacity, size_t *written);
+mpegts_status mpegts_program_tables_write_all(mpegts_program_tables *tables, uint8_t *out, size_t capacity,
+                                              size_t *written);
+/* Continuity counter (0 to 15) of the next packet on PID 0 or a PMT PID. */
+mpegts_status mpegts_program_tables_continuity_counter(const mpegts_program_tables *tables, uint16_t pid,
+                                                       uint8_t *cc);
+mpegts_status mpegts_program_tables_set_continuity_counter(mpegts_program_tables *tables, uint16_t pid, uint8_t cc);
+
+/* mpegts_pes_unit.flags */
+#define MPEGTS_PES_HAS_PTS 0x01
+#define MPEGTS_PES_HAS_DTS 0x02        /* needs HAS_PTS; omitted when equal to the PTS */
+#define MPEGTS_PES_HAS_PCR 0x04        /* PCR in the first TS packet */
+#define MPEGTS_PES_DATA_ALIGNMENT 0x08 /* CARRIAGE_PES only; KLV sets its own */
+#define MPEGTS_PES_RANDOM_ACCESS 0x10  /* random_access_indicator in the first TS packet */
+#define MPEGTS_PES_ES_PRIORITY 0x20    /* elementary_stream_priority_indicator */
+#define MPEGTS_PES_HAS_SERVICE_ID 0x40 /* METADATA_CELLS: service_id instead of the stream's */
+
+/* One unit (access unit, KLV packet, any payload) to write. */
+typedef struct mpegts_pes_unit {
+    uint32_t struct_size;
+    uint32_t flags; /* MPEGTS_PES_* */
+    uint64_t pts;   /* 90 kHz, with HAS_PTS (taken modulo 2^33) */
+    uint64_t dts;   /* 90 kHz, with HAS_DTS */
+    uint64_t pcr;   /* 27 MHz, with HAS_PCR */
+    const uint8_t *data; /* may be NULL when data_len is 0 */
+    uint64_t data_len;
+    uint8_t service_id; /* with HAS_SERVICE_ID */
+    uint8_t reserved[7];
+} mpegts_pes_unit;
+
+/* A writer for one elementary stream on `pid` (0x0010 to 0x1FFE). */
+mpegts_status mpegts_pes_writer_new(uint16_t pid, const mpegts_stream_spec *spec, mpegts_pes_writer **out);
+void mpegts_pes_writer_free(mpegts_pes_writer *writer); /* NULL is ignored */
+mpegts_status mpegts_pes_writer_error(const mpegts_pes_writer *writer, char *message, size_t message_len);
+/* Write one unit as PES packets in TS packets. A unit that breaks its
+ * carriage's rules (sync KLV without a PTS, async KLV with one, a PCR on a
+ * KLV PID, an empty KLV unit, ...) gives MPEGTS_ERR_INVALID; sync KLV units
+ * over 65,522 bytes are fragmented into one cell per PES, each with the
+ * unit's PTS; async KLV units over 65,532 bytes are split. */
+mpegts_status mpegts_pes_writer_write(mpegts_pes_writer *writer, const mpegts_pes_unit *unit, uint8_t *out,
+                                      size_t capacity, size_t *written);
+/* One packet with an adaptation field and no payload, e.g. a PCR between
+ * frames. flags: MPEGTS_PES_HAS_PCR, RANDOM_ACCESS, ES_PRIORITY (refused on
+ * KLV PIDs). */
+mpegts_status mpegts_pes_writer_write_adaptation_only(mpegts_pes_writer *writer, uint32_t flags, uint64_t pcr,
+                                                      uint8_t *out, size_t capacity, size_t *written);
+/* Continuity counter (0 to 15) of the next packet with payload. After
+ * setting one that breaks the sequence, mark a discontinuity. */
+mpegts_status mpegts_pes_writer_continuity_counter(const mpegts_pes_writer *writer, uint8_t *cc);
+mpegts_status mpegts_pes_writer_set_continuity_counter(mpegts_pes_writer *writer, uint8_t cc);
+/* Set discontinuity_indicator in the next packet. */
+mpegts_status mpegts_pes_writer_mark_discontinuity(mpegts_pes_writer *writer);
+/* sequence_number of the next metadata access unit cell. */
+mpegts_status mpegts_pes_writer_sequence_number(const mpegts_pes_writer *writer, uint8_t *sequence);
+mpegts_status mpegts_pes_writer_set_sequence_number(mpegts_pes_writer *writer, uint8_t sequence);
+
+/* A null packet (PID 0x1FFF) into packet[0..188). */
+mpegts_status mpegts_null_packet(uint8_t *packet);
 
 #ifdef __cplusplus
 }
