@@ -300,10 +300,11 @@ enum PesState {
 }
 
 /// Joining an existing synchronous KLV stream (st1402-time.md D-5): its
-/// continuity counters are renumbered so that ours fit in, and with
-/// [`CellNumbering::PerStream`] its cell sequence numbers too (with the
-/// default, each PES packet numbers its own cells, so the input's stay as
-/// they are; DECISIONS X-8); access unit bytes are never changed.
+/// continuity counters and cell sequence numbers are renumbered so that
+/// ours fit in (one cell counter per PID, DECISIONS X-8). With the
+/// [`CellNumbering::PerAccessUnit`] workaround each PES packet numbers its
+/// own cells, so the input's cell headers stay as they are. Access unit
+/// bytes are never changed.
 #[derive(Debug)]
 struct Merge {
     pid: u16,
@@ -315,7 +316,7 @@ struct Merge {
     /// PES header bytes seen (for the PTS).
     head: [u8; 14],
     /// Next cell sequence_number of the stream (R-ISO13818-140), with
-    /// [`CellNumbering::PerStream`].
+    /// [`CellNumbering::PerStream`] (the default).
     seq: Option<u8>,
     /// Renumber the input's cells (per-stream numbering).
     renumber: bool,

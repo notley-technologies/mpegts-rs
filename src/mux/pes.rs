@@ -226,10 +226,9 @@ impl Iterator for Segments {
                 let length = 3 + 5 + CELL_HEADER_LEN + n;
                 seg.header_len = write_header(&mut seg.header, p.stream_id, length, true, first, p.pts, None);
                 let fragment = CellFragment::of(self.index, p.cells());
-                // sequence_number: from 0 at the start of the access unit,
-                // +1 per fragment (DECISIONS X-8), so a complete access unit
-                // is cell 0 of its PES packet; or per stream, +1 per cell
-                // modulo 256 (R-ISO13818-140).
+                // sequence_number: per stream, +1 per cell modulo 256
+                // (R-ISO13818-140, DECISIONS X-8); or, as a workaround,
+                // from 0 at the start of the access unit, +1 per fragment.
                 let sequence = match p.numbering {
                     CellNumbering::PerAccessUnit => self.index as u8,
                     CellNumbering::PerStream => p.sequence.wrapping_add(self.index as u8),
@@ -326,8 +325,8 @@ fn write_header(
 /// let mut sink = SliceSink::new(&mut buf);
 /// let packets = writer.write(&PesUnit::new(&klv).with_pts(900_000), &mut sink)?;
 /// assert_eq!(packets, 1);
-/// // Each access unit's cells are numbered from 0 (DECISIONS X-8).
-/// assert_eq!(writer.sequence_number(), 0);
+/// // One cell counter per PID (DECISIONS X-8): the next cell is number 1.
+/// assert_eq!(writer.sequence_number(), 1);
 /// # Ok::<(), mpegts::mux::MuxError>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,7 +353,7 @@ impl PesWriter {
             return Err(MuxError::InvalidPid { pid, reason: "elementary stream PIDs are 0x0010 to 0x1FFE" });
         }
         StreamSpec::check_pes(stream_id, carriage)?;
-        Ok(PesWriter { ts: TsWriter::new(pid)?, stream_id, carriage, sequence: 0, numbering: CellNumbering::PerAccessUnit })
+        Ok(PesWriter { ts: TsWriter::new(pid)?, stream_id, carriage, sequence: 0, numbering: CellNumbering::PerStream })
     }
 
     /// Synchronous KLV on `pid` (stream_id 0xFC, metadata cells for
@@ -396,9 +395,9 @@ impl PesWriter {
         &mut self.ts
     }
 
-    /// The sequence_number the next access unit's first cell gets: always 0
-    /// with [`CellNumbering::PerAccessUnit`] (the default), the stream's
-    /// counter with [`CellNumbering::PerStream`].
+    /// The sequence_number the next access unit's first cell gets: the
+    /// stream's counter with [`CellNumbering::PerStream`] (the default),
+    /// always 0 with [`CellNumbering::PerAccessUnit`].
     pub fn sequence_number(&self) -> u8 {
         match self.numbering {
             CellNumbering::PerAccessUnit => 0,
@@ -631,8 +630,8 @@ mod tests {
         assert_eq!(heads[0], [7, 250, 0x9F, 0xFF, 0xF2]);
         assert_eq!(heads[1], [7, 251, 0x0F, 0xFF, 0xF2]);
         assert_eq!(heads[2], [7, 252, 0x4F, 0x00, 0x01]);
-        // Per access unit (the default, DECISIONS X-8): from 0, +1 per
-        // fragment.
+        // Per access unit (the workaround of DECISIONS X-8): from 0, +1
+        // per fragment.
         let per_au = Plan { numbering: CellNumbering::PerAccessUnit, ..plan(65_522 * 2 + 1, cells, Some(5)) };
         let heads: Vec<[u8; 5]> = per_au.segments().map(|s| s.cell.unwrap()).collect();
         assert_eq!(heads.iter().map(|h| h[1]).collect::<Vec<_>>(), [0, 1, 2]);

@@ -38,9 +38,10 @@ pub const MPEGTS_INJECT_HAS_SERVICE_ID: u32 = 0x01;
 pub const MPEGTS_INJECT_HAS_PID: u32 = 0x02;
 pub const MPEGTS_INJECT_NO_FRAME_ALIGN: u32 = 0x04;
 pub const MPEGTS_INJECT_SYNC_REGISTRATION: u32 = 0x08;
-/// Number metadata cells per stream instead of per access unit (DECISIONS
-/// X-8): [`CellNumbering::PerStream`](crate::mux::CellNumbering::PerStream).
-pub const MPEGTS_INJECT_CELLS_PER_STREAM: u32 = 0x10;
+/// Number metadata cells from 0 in each access unit instead of per stream,
+/// a workaround for receivers that require it (DECISIONS X-8):
+/// [`CellNumbering::PerAccessUnit`](crate::mux::CellNumbering::PerAccessUnit).
+pub const MPEGTS_INJECT_CELLS_PER_AU: u32 = 0x10;
 const CONFIG_FLAGS: u32 = 0x1F;
 
 pub const MPEGTS_INJECT_UNIT_HAS_PTS: u32 = 0x01;
@@ -262,8 +263,8 @@ impl mpegts_inject_config {
         if c.sync.sync_registration_descriptor {
             flags |= MPEGTS_INJECT_SYNC_REGISTRATION;
         }
-        if c.sync.cell_numbering == crate::mux::CellNumbering::PerStream {
-            flags |= MPEGTS_INJECT_CELLS_PER_STREAM;
+        if c.sync.cell_numbering == crate::mux::CellNumbering::PerAccessUnit {
+            flags |= MPEGTS_INJECT_CELLS_PER_AU;
         }
         mpegts_inject_config {
             struct_size: size_of_u32::<mpegts_inject_config>(),
@@ -325,10 +326,10 @@ impl mpegts_inject_config {
         let size = |v: u64| usize::try_from(v).map_err(|_| "a limit is too large");
         let sync = SyncKlvOptions {
             sync_registration_descriptor: self.flags & MPEGTS_INJECT_SYNC_REGISTRATION != 0,
-            cell_numbering: if self.flags & MPEGTS_INJECT_CELLS_PER_STREAM != 0 {
-                crate::mux::CellNumbering::PerStream
-            } else {
+            cell_numbering: if self.flags & MPEGTS_INJECT_CELLS_PER_AU != 0 {
                 crate::mux::CellNumbering::PerAccessUnit
+            } else {
+                crate::mux::CellNumbering::PerStream
             },
             input_leak_rate: self.input_leak_rate,
             buffer_size: self.buffer_size,

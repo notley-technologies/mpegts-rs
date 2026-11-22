@@ -197,10 +197,10 @@ int main(int argc, char **argv) {
     printf("ERR %s\n", message);
     check("sequence", mpegts_pes_writer_sequence_number(sync, &value));
     printf("SEQ %u\n", value);
-    check("numbering", mpegts_pes_writer_set_cell_numbering(sync, MPEGTS_CELLS_PER_STREAM));
-    check("sequence", mpegts_pes_writer_sequence_number(sync, &value));
-    printf("SEQ_PER_STREAM %u\n", value);
     check("numbering", mpegts_pes_writer_set_cell_numbering(sync, MPEGTS_CELLS_PER_AU));
+    check("sequence", mpegts_pes_writer_sequence_number(sync, &value));
+    printf("SEQ_PER_AU %u\n", value);
+    check("numbering", mpegts_pes_writer_set_cell_numbering(sync, MPEGTS_CELLS_PER_STREAM));
     check("cc", mpegts_pes_writer_continuity_counter(video, &value));
     check("adaptation_only", mpegts_pes_writer_write_adaptation_only(video, MPEGTS_PES_HAS_PCR, 27000000ull * 2,
                                                                       room(188), 188, &written));

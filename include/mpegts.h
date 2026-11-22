@@ -546,18 +546,19 @@ mpegts_status mpegts_pes_writer_continuity_counter(const mpegts_pes_writer *writ
 mpegts_status mpegts_pes_writer_set_continuity_counter(mpegts_pes_writer *writer, uint8_t cc);
 /* Set discontinuity_indicator in the next packet. */
 mpegts_status mpegts_pes_writer_mark_discontinuity(mpegts_pes_writer *writer);
-/* sequence_number of the next access unit's first cell: 0 when cells are
- * numbered per access unit (the default), the stream's counter when numbered
- * per stream. Setting it sets the per-stream counter. */
+/* sequence_number of the next access unit's first cell: the stream's counter
+ * when cells are numbered per stream (the default), 0 when numbered per
+ * access unit. Setting it sets the per-stream counter. */
 mpegts_status mpegts_pes_writer_sequence_number(const mpegts_pes_writer *writer, uint8_t *sequence);
 mpegts_status mpegts_pes_writer_set_sequence_number(mpegts_pes_writer *writer, uint8_t sequence);
 /* How metadata cells are numbered (ISO/IEC 13818-1 2.12.4.1, DECISIONS X-8):
- * MPEGTS_CELLS_PER_AU (default) starts each access unit at 0 and counts its
- * fragments on (a complete access unit is cell 0 of its PES packet);
- * MPEGTS_CELLS_PER_STREAM counts every cell of the PID modulo 256.
+ * MPEGTS_CELLS_PER_STREAM (default, as the standard asks) counts every cell
+ * of the PID modulo 256; MPEGTS_CELLS_PER_AU starts each access unit at 0
+ * and counts its fragments on (a complete access unit is cell 0 of its PES
+ * packet), a workaround for receivers that require it (MediaMTX).
  * MPEGTS_ERR_INVALID for another value. */
-#define MPEGTS_CELLS_PER_AU 0
-#define MPEGTS_CELLS_PER_STREAM 1
+#define MPEGTS_CELLS_PER_STREAM 0
+#define MPEGTS_CELLS_PER_AU 1
 mpegts_status mpegts_pes_writer_set_cell_numbering(mpegts_pes_writer *writer, uint32_t numbering);
 
 /* A null packet (PID 0x1FFF) into packet[0..188). */
@@ -636,8 +637,9 @@ typedef struct mpegts_inject_units mpegts_inject_units;   /* opaque, frame callb
 #define MPEGTS_INJECT_HAS_PID 0x02           /* use pid (else a free one) */
 #define MPEGTS_INJECT_NO_FRAME_ALIGN 0x04    /* send sync units as their window opens */
 #define MPEGTS_INJECT_SYNC_REGISTRATION 0x08 /* also the "KLVA" registration_descriptor */
-#define MPEGTS_INJECT_CELLS_PER_STREAM 0x10  /* number cells per stream, not per AU (X-8); an
-                                              * existing sync stream joined is renumbered */
+#define MPEGTS_INJECT_CELLS_PER_AU 0x10      /* number cells from 0 in each AU, not per stream
+                                              * (X-8 workaround); an existing sync stream
+                                              * joined keeps its cell headers */
 
 /* Settings. Fill with mpegts_inject_config_default, then change fields. */
 typedef struct mpegts_inject_config {

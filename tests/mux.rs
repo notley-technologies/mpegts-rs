@@ -160,8 +160,8 @@ fn sync_klv_access_units_of_every_size_round_trip() {
         cells += (len + MAX_CELL_DATA - 1) / MAX_CELL_DATA;
         units.push((pts, au));
     }
-    // Each access unit numbers its cells from 0 (X-8).
-    assert_eq!(w.sequence_number(), 0);
+    // One counter per PID, +1 per cell (X-8).
+    assert_eq!(usize::from(w.sequence_number()), cells % 256);
     check_packets(&ts, &[0, 0x1000]);
 
     let (d, ids) = demux(
@@ -183,6 +183,7 @@ fn sync_klv_access_units_of_every_size_round_trip() {
     assert_eq!(stripped.len(), cells);
     assert_eq!(raw.len(), cells);
     let mut k = 0;
+    let mut sequence = 0u8;
     for (pts, au) in &units {
         let count = (au.len() + MAX_CELL_DATA - 1) / MAX_CELL_DATA;
         let mut joined = Vec::new();
@@ -202,8 +203,9 @@ fn sync_klv_access_units_of_every_size_round_trip() {
             assert_eq!(usize::from(cell.data_length) + 5, r.payload().len());
             assert_eq!(cell.fragment, CellFragment::of(c, count));
             assert_eq!(cell.random_access, c == 0, "RAI on complete and first cells only (R-ST1402TIME-32)");
-            assert_eq!((cell.service_id, cell.sequence_number, cell.decoder_config), (0, c as u8, false));
+            assert_eq!((cell.service_id, cell.sequence_number, cell.decoder_config), (0, sequence, false));
             assert_eq!(r.payload()[2] & 0x0F, 0x0F, "reserved '1111'");
+            sequence = sequence.wrapping_add(1);
             k += 1;
         }
         assert_eq!(&joined, au);
@@ -278,8 +280,8 @@ fn fragmented_access_units_above_65535_bytes() {
 #[test]
 fn several_services_share_one_sync_stream() {
     // ST 1402-13: more synchronous metadata goes into the existing stream as
-    // another service; cells are numbered per access unit (X-8), or with
-    // per-stream numbering by one counter over both services.
+    // another service; one cell counter runs over both services (X-8),
+    // or with the per-access-unit workaround each access unit starts at 0.
     let mut spec = StreamSpec::klv_sync(0);
     spec.add_metadata_service(5).unwrap();
     let t = tables(&[(0x101, &spec)], None);
@@ -291,15 +293,15 @@ fn several_services_share_one_sync_stream() {
     w.write(&PesUnit::new(b"service five").with_pts(1000).with_service(5), &mut ts).unwrap();
     let (d, ids) = demux(&ts, &[Subscription::new(Select::Pid(0x101), Unit::Pes)]);
     let cells: Vec<(u8, u8)> = d.of(ids[0]).iter().map(|o| (o.payload()[0], o.payload()[1])).collect();
-    assert_eq!(cells, [(0, 0), (5, 0)]);
-    w.set_cell_numbering(mpegts::mux::CellNumbering::PerStream);
+    assert_eq!(cells, [(0, 0), (5, 1)]);
+    w.set_cell_numbering(mpegts::mux::CellNumbering::PerAccessUnit);
     let mut ts2 = Vec::new();
     t.clone().write_all(&mut ts2).unwrap();
     w.write(&PesUnit::new(b"service zero").with_pts(1000), &mut ts2).unwrap();
     w.write(&PesUnit::new(b"service five").with_pts(1000).with_service(5), &mut ts2).unwrap();
     let (d2, ids2) = demux(&ts2, &[Subscription::new(Select::Pid(0x101), Unit::Pes)]);
     let cells: Vec<(u8, u8)> = d2.of(ids2[0]).iter().map(|o| (o.payload()[0], o.payload()[1])).collect();
-    assert_eq!(cells, [(0, 2), (5, 3)], "the per-stream counter ran on under the default too");
+    assert_eq!(cells, [(0, 0), (5, 0)]);
     let tags: Vec<u8> = d.report.stream(0x101).unwrap().descriptors.iter().map(|d| d.tag).collect();
     assert_eq!(tags, [0x26, 0x26, 0x27]);
 }
@@ -465,7 +467,6 @@ fn pcr_packets_and_the_timeline() {
 fn short_sinks_change_nothing() {
     let au = bytes(70_000, 3);
     let mut w = PesWriter::klv_sync(0x101, 0).unwrap();
-    w.set_cell_numbering(mpegts::mux::CellNumbering::PerStream);
     w.set_sequence_number(254);
     w.ts_mut().set_continuity_counter(14);
     let unit = PesUnit::new(&au).with_pts(0);

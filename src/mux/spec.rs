@@ -114,7 +114,7 @@ pub struct SyncKlvOptions {
     /// metadata_output_leak_rate, 22 bits. Default 0 (R-ST1402TIME-31).
     pub output_leak_rate: u32,
     /// How cell sequence numbers are counted. Default
-    /// [`CellNumbering::PerAccessUnit`] (DECISIONS X-8).
+    /// [`CellNumbering::PerStream`], as the standard asks (DECISIONS X-8).
     pub cell_numbering: CellNumbering,
 }
 
@@ -126,7 +126,7 @@ impl Default for SyncKlvOptions {
             input_leak_rate: MAX_22_BITS,
             buffer_size: 0x400,
             output_leak_rate: 0,
-            cell_numbering: CellNumbering::PerAccessUnit,
+            cell_numbering: CellNumbering::PerStream,
         }
     }
 }

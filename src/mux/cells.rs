@@ -70,8 +70,8 @@ pub struct CellHeader {
     /// metadata_service_id, equal to the service's metadata_descriptor
     /// (R-ISO13818-146).
     pub service_id: u8,
-    /// sequence_number: from 0 at the start of each access unit, +1 per
-    /// cell, whatever the service (R-ISO13818-140, DECISIONS X-8); see
+    /// sequence_number: one counter per PID, +1 per cell modulo 256,
+    /// whatever the service (R-ISO13818-140, DECISIONS X-8); see
     /// [`CellNumbering`].
     pub sequence_number: u8,
     /// cell_fragment_indication.
@@ -167,22 +167,27 @@ mod tests {
 /// How the sequence_number of metadata access unit cells is counted.
 ///
 /// ISO/IEC 13818-1 2.12.4.1: "This number increments by one for each
-/// successive metadata_AU_cell constituting the metadata_AU_wrapper", the
-/// wrapper being the cells of one PES packet. DECISIONS X-8: each access
-/// unit numbers its cells from 0. An access unit in one PES packet (every
-/// one up to 65,522 bytes) is then cell 0 of its wrapper, which MediaMTX
-/// (its `mediacommon` library) requires; the fragments of a larger one,
-/// one per PES packet, go on counting 1, 2, ... so a receiver can tell
-/// that none was lost and join them (the patched FFmpeg does). The
-/// per-stream reading of the first release is kept as an option.
+/// successive metadata_AU_cell constituting the metadata_AU_wrapper,
+/// independent of the coded value of the metadata_service_id", the counter
+/// being there "to identify loss of metadata_AU_cells" (2.12.4); ST 1402.2
+/// Appendix B: "increments each cell". Neither restarts the count, and only
+/// a count that runs on across PES packets can show a lost cell, so the
+/// default is one counter per PID (DECISIONS X-8).
+///
+/// [`CellNumbering::PerAccessUnit`] is a workaround for receivers that
+/// refuse a PES packet whose first cell is not 0: MediaMTX, through its
+/// `mediacommon` library (v2.9.7 and earlier at least), drops 255 of
+/// every 256 access units numbered per stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum CellNumbering {
-    /// From 0 at the start of each access unit, +1 per cell (fragment),
-    /// across the PES packets that carry it. The default.
-    #[default]
-    PerAccessUnit,
     /// One counter per PID, +1 per cell, modulo 256, whatever the access
-    /// unit or service (the reading of D-ISO13818-07 before X-8).
+    /// unit or service. The default, as the standard asks.
+    #[default]
     PerStream,
+    /// From 0 at the start of each access unit, +1 per cell (fragment),
+    /// across the PES packets that carry it, so an access unit in one PES
+    /// packet is always cell 0. Not the standard's numbering: only for
+    /// receivers that require it (see the type's documentation).
+    PerAccessUnit,
 }
